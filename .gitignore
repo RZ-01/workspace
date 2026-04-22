@@ -1,0 +1,15 @@
+# Ignore image/document/script files
+*.tif
+*.pdf
+*.png
+*.sh
+
+# Ignore checkpoints directories
+checkpoints/
+**/checkpoints/
+deconv/
+
+__pycache__/
+*.pyc
+
+README.md
