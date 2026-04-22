@@ -12,4 +12,6 @@ deconv/
 __pycache__/
 *.pyc
 
-README.mdnon-blind-deconv/gt_dragon.ply
+README.md
+
+non-blind-deconv/gt_dragon.ply
