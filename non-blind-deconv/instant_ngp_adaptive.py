@@ -12,16 +12,26 @@ from tqdm import tqdm
 
 from models.instantngp import InstantNGPTorchModel
 from sample_strategy.random_sample import sample_random_coords
+from gmm_psf import GMMPsf
 
 
 class VolumeDataset(Dataset):
-    def __init__(self, norm_volume_tensor, num_mc_samples, num_pixels_per_step, num_batches, discrete_psf):
+    def __init__(
+        self,
+        norm_volume_tensor,
+        num_mc_samples,
+        num_pixels_per_step,
+        num_batches,
+        discrete_psf,
+        gmm_psf: GMMPsf = None,
+    ):
         self.norm_volume_tensor = norm_volume_tensor
         self.num_mc_samples = num_mc_samples
         self.num_pixels_per_step = num_pixels_per_step
         self.num_batches = num_batches
         self.volume_shape = norm_volume_tensor.shape
         self.discrete_psf = discrete_psf.cpu()
+        self.gmm_psf = gmm_psf          # None → discrete mode; set → GMM mode
 
         vz, vy, vx = self.volume_shape
         self.inv_shape = torch.tensor([1.0 / (vz - 1), 1.0 / (vy - 1), 1.0 / (vx - 1)], dtype=torch.float32)
@@ -31,21 +41,28 @@ class VolumeDataset(Dataset):
 
     def _generate_offsets(self):
         sampling_budget = self.num_mc_samples * self.num_pixels_per_step
-        psf_shape = self.discrete_psf.shape
 
-        psf_flat = self.discrete_psf.flatten()
-        psf_flat = psf_flat / psf_flat.sum()
-        sampled_indices = torch.multinomial(psf_flat, sampling_budget, replacement=True)
+        if self.gmm_psf is not None:
+            # ── GMM branch: continuous (sub-pixel) offsets ──────────────────
+            # GMMPsf.sample() returns (N, n_dims) float32 pixel offsets,
+            # already centred at the PSF origin, matching the discrete branch.
+            offsets = self.gmm_psf.sample(sampling_budget)   # (N, n_dims)
+        else:
+            # ── Discrete branch: integer offsets via multinomial ─────────────
+            psf_shape = self.discrete_psf.shape
+            psf_flat = self.discrete_psf.flatten()
+            psf_flat = psf_flat / psf_flat.sum()
+            sampled_indices = torch.multinomial(psf_flat, sampling_budget, replacement=True)
 
-        d, h, w = psf_shape
-        z_idx = sampled_indices // (h * w)
-        y_idx = (sampled_indices % (h * w)) // w
-        x_idx = sampled_indices % w
-        offsets = torch.stack([
-            z_idx.float() - (d - 1) / 2.0,
-            y_idx.float() - (h - 1) / 2.0,
-            x_idx.float() - (w - 1) / 2.0,
-        ], dim=1)
+            d, h, w = psf_shape
+            z_idx = sampled_indices // (h * w)
+            y_idx = (sampled_indices % (h * w)) // w
+            x_idx = sampled_indices % w
+            offsets = torch.stack([
+                z_idx.float() - (d - 1) / 2.0,
+                y_idx.float() - (h - 1) / 2.0,
+                x_idx.float() - (w - 1) / 2.0,
+            ], dim=1)
 
         return offsets
 
@@ -141,6 +158,23 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension of MLP")
     parser.add_argument("--num_layers", type=int, default=2, help="Number of MLP layers")
 
+    # PSF sampling mode
+    parser.add_argument("--psf_mode", type=str, default="discrete", choices=["discrete", "gmm"],
+                        help="PSF sampling mode: 'discrete' (multinomial integer offsets) "
+                             "or 'gmm' (Gaussian Mixture Model continuous offsets)")
+    parser.add_argument("--gmm_components", type=int, default=64,
+                        help="[GMM mode] Number of Gaussian components")
+    parser.add_argument("--gmm_covariance_type", type=str, default="full",
+                        choices=["full", "diag", "tied", "spherical"],
+                        help="[GMM mode] Covariance type for GaussianMixture")
+    parser.add_argument("--gmm_max_iter", type=int, default=500,
+                        help="[GMM mode] Maximum EM iterations when fitting GMM")
+    parser.add_argument("--gmm_n_init", type=int, default=3,
+                        help="[GMM mode] Number of EM initialisations (best kept)")
+    parser.add_argument("--gmm_checkpoint", type=str, default=None,
+                        help="[GMM mode] Path to a pre-fitted GMMPsf .pkl file. "
+                             "If not set, the GMM is fitted from --psf_path before training.")
+
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
@@ -226,12 +260,37 @@ def main():
     scaler = GradScaler()
     writer = SummaryWriter(log_dir=args.logdir)
 
+    # ── PSF sampling mode setup ──────────────────────────────────────────
+    gmm_psf = None
+    if args.psf_mode == "gmm":
+        if args.gmm_checkpoint is not None and os.path.isfile(args.gmm_checkpoint):
+            print(f"Loading pre-fitted GMM PSF from {args.gmm_checkpoint}")
+            gmm_psf = GMMPsf.load(args.gmm_checkpoint)
+        else:
+            print("Fitting GMM PSF from discrete PSF ...")
+            gmm_psf = GMMPsf.from_discrete_psf(
+                psf=discrete_psf_np,
+                n_components=args.gmm_components,
+                covariance_type=args.gmm_covariance_type,
+                max_iter=args.gmm_max_iter,
+                n_init=args.gmm_n_init,
+                verbose=True,
+            )
+            # Auto-save alongside the volume checkpoint
+            gmm_save_path = args.save_path.replace(".pth", "_gmm.pkl")
+            gmm_psf.save(gmm_save_path)
+        print(f"PSF mode: GMM  (K={gmm_psf.n_components} components, "
+              f"covariance={gmm_psf.gmm.covariance_type})")
+    else:
+        print("PSF mode: discrete (multinomial integer offsets)")
+
     dataset = VolumeDataset(
         norm_volume_tensor=vol_norm,  # numpy memmap — NOT converted to tensor
         num_mc_samples=args.num_mc_samples,
         num_pixels_per_step=args.num_pixels_per_step,
         num_batches=args.steps,
         discrete_psf=discrete_psf,
+        gmm_psf=gmm_psf,
     )
 
     dataloader = DataLoader(
