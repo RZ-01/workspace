@@ -169,20 +169,99 @@ class GMMPsf:
 
     def sample(self, n: int, device: torch.device = None) -> torch.Tensor:
         """
-        Draw *n* continuous (sub-pixel) offsets from the fitted GMM.
-
-        Returns
-        -------
-        offsets : torch.Tensor, shape (n, n_dims), dtype float32
-            Pixel-unit offsets centred at the PSF origin.  These are
-            drop-in replacements for the integer offsets produced by the
-            discrete multinomial sampler.
+        Draw *n* offsets from the GMM using sklearn (CPU).
+        For training loops prefer :meth:`sample_gpu` to avoid CPU→GPU transfer.
         """
-        samples_np, _ = self.gmm.sample(n)             # (n, n_dims) float64
+        samples_np, _ = self.gmm.sample(n)
         offsets = torch.from_numpy(samples_np.astype(np.float32))
         if device is not None:
             offsets = offsets.to(device)
         return offsets
+
+    # ------------------------------------------------------------------
+    # GPU-native sampling (avoids CPU→GPU transfer in training loops)
+    # ------------------------------------------------------------------
+
+    def prepare_gpu(self, device: torch.device) -> None:
+        """
+        Precompute and cache GMM parameters as GPU tensors.
+
+        Call once before the training loop.  Subsequent calls to
+        :meth:`sample_gpu` will reuse the cached tensors.
+        """
+        self._gpu_device = device
+        self._weights_gpu = torch.tensor(
+            self.gmm.weights_, dtype=torch.float32, device=device
+        )  # (K,)
+        self._means_gpu = torch.tensor(
+            self.gmm.means_, dtype=torch.float32, device=device
+        )  # (K, D)
+
+        cov_type = self.gmm.covariance_type
+        self._cov_type_gpu = cov_type
+
+        if cov_type == "full":
+            covs = torch.tensor(
+                self.gmm.covariances_, dtype=torch.float32, device=device
+            )  # (K, D, D)
+            self._L_gpu = torch.linalg.cholesky(covs)  # (K, D, D)
+        elif cov_type == "diag":
+            self._stds_gpu = torch.tensor(
+                np.sqrt(self.gmm.covariances_), dtype=torch.float32, device=device
+            )  # (K, D)
+        elif cov_type == "tied":
+            cov = torch.tensor(
+                self.gmm.covariances_, dtype=torch.float32, device=device
+            )  # (D, D)
+            self._L_gpu = torch.linalg.cholesky(cov)  # (D, D)
+        elif cov_type == "spherical":
+            self._stds_gpu = torch.tensor(
+                np.sqrt(self.gmm.covariances_), dtype=torch.float32, device=device
+            )  # (K,)
+
+        print(
+            f"GMMPsf GPU tensors cached on {device}  "
+            f"(K={self.n_components}, cov={cov_type})"
+        )
+
+    def sample_gpu(self, n: int, device: torch.device) -> torch.Tensor:
+        """
+        Draw *n* offsets entirely on the GPU — no CPU→GPU transfer.
+
+        Requires :meth:`prepare_gpu` to have been called with the same device,
+        or calls it automatically on the first use.
+
+        Returns
+        -------
+        offsets : torch.Tensor, shape (n, n_dims), float32, on *device*
+        """
+        if not hasattr(self, "_gpu_device") or self._gpu_device != device:
+            self.prepare_gpu(device)
+
+        # 1. Sample component indices proportional to mixture weights
+        k_idx = torch.multinomial(self._weights_gpu, n, replacement=True)  # (n,)
+        selected_means = self._means_gpu[k_idx]  # (n, D)
+
+        # 2. Sample from the selected Gaussian components
+        if self._cov_type_gpu == "full":
+            selected_L = self._L_gpu[k_idx]          # (n, D, D)
+            eps = torch.randn(n, self.n_dims, 1, device=device)
+            samples = selected_means + (selected_L @ eps).squeeze(-1)
+        elif self._cov_type_gpu == "diag":
+            selected_stds = self._stds_gpu[k_idx]    # (n, D)
+            eps = torch.randn(n, self.n_dims, device=device)
+            samples = selected_means + selected_stds * eps
+        elif self._cov_type_gpu == "tied":
+            eps = torch.randn(n, self.n_dims, 1, device=device)
+            samples = selected_means + (self._L_gpu @ eps).squeeze(-1)
+        elif self._cov_type_gpu == "spherical":
+            selected_stds = self._stds_gpu[k_idx].unsqueeze(-1)  # (n, 1)
+            eps = torch.randn(n, self.n_dims, device=device)
+            samples = selected_means + selected_stds * eps
+        else:
+            raise ValueError(f"Unknown covariance type: {self._cov_type_gpu}")
+
+        return samples.float()  # (n, D)
 
     def log_prob(self, coords: np.ndarray) -> np.ndarray:
         """
@@ -249,6 +328,55 @@ class GMMPsf:
             data = pickle.load(f)
         obj = cls(gmm=data["gmm"], psf_shape=data["psf_shape"])
         print(f"GMM PSF loaded from {path}  (n_components={obj.n_components}, shape={obj.psf_shape})")
+        return obj
+
+    @classmethod
+    def load_or_fit(
+        cls,
+        checkpoint_path: str,
+        psf: np.ndarray = None,
+        n_components: int = 64,
+        covariance_type: str = "full",
+        max_iter: int = 500,
+        n_init: int = 3,
+        random_state: int = 42,
+        verbose: bool = True,
+    ) -> "GMMPsf":
+        """
+        Load a pre-fitted GMM from *checkpoint_path* if it exists,
+        otherwise fit a new GMM from *psf* and save it to *checkpoint_path*.
+
+        Parameters
+        ----------
+        checkpoint_path : str
+            Path to a .pkl file.  Loaded if it exists; written after fitting
+            if it does not.
+        psf : np.ndarray, optional
+            Discrete PSF array.  Required when the checkpoint does not exist.
+        All other kwargs are forwarded to :meth:`from_discrete_psf`.
+        """
+        if checkpoint_path is not None and os.path.isfile(checkpoint_path):
+            print(f"Loading pre-fitted GMM PSF from {checkpoint_path}")
+            return cls.load(checkpoint_path)
+
+        if psf is None:
+            raise ValueError(
+                "checkpoint_path does not exist and psf=None — "
+                "cannot fit GMM without a PSF array."
+            )
+
+        print("Fitting GMM PSF from discrete PSF ...")
+        obj = cls.from_discrete_psf(
+            psf=psf,
+            n_components=n_components,
+            covariance_type=covariance_type,
+            max_iter=max_iter,
+            n_init=n_init,
+            random_state=random_state,
+            verbose=verbose,
+        )
+        if checkpoint_path is not None:
+            obj.save(checkpoint_path)
         return obj
 
 

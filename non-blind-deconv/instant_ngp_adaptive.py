@@ -16,76 +16,82 @@ from gmm_psf import GMMPsf
 
 
 class VolumeDataset(Dataset):
+    """
+    Provides (target_coords, target_values) batches from the volume.
+
+    PSF offset generation has been moved to the GPU training step
+    (see generate_offsets_on_gpu) to eliminate a large CPU→GPU transfer.
+    """
     def __init__(
         self,
         norm_volume_tensor,
-        num_mc_samples,
         num_pixels_per_step,
         num_batches,
-        discrete_psf,
-        gmm_psf: GMMPsf = None,
     ):
         self.norm_volume_tensor = norm_volume_tensor
-        self.num_mc_samples = num_mc_samples
         self.num_pixels_per_step = num_pixels_per_step
         self.num_batches = num_batches
         self.volume_shape = norm_volume_tensor.shape
-        self.discrete_psf = discrete_psf.cpu()
-        self.gmm_psf = gmm_psf          # None → discrete mode; set → GMM mode
 
         vz, vy, vx = self.volume_shape
-        self.inv_shape = torch.tensor([1.0 / (vz - 1), 1.0 / (vy - 1), 1.0 / (vx - 1)], dtype=torch.float32)
+        self.inv_shape = torch.tensor(
+            [1.0 / (vz - 1), 1.0 / (vy - 1), 1.0 / (vx - 1)],
+            dtype=torch.float32,
+        )
 
     def __len__(self):
         return self.num_batches
 
-    def _generate_offsets(self):
-        sampling_budget = self.num_mc_samples * self.num_pixels_per_step
-
-        if self.gmm_psf is not None:
-            # ── GMM branch: continuous (sub-pixel) offsets ──────────────────
-            # GMMPsf.sample() returns (N, n_dims) float32 pixel offsets,
-            # already centred at the PSF origin, matching the discrete branch.
-            offsets = self.gmm_psf.sample(sampling_budget)   # (N, n_dims)
-        else:
-            # ── Discrete branch: integer offsets via multinomial ─────────────
-            psf_shape = self.discrete_psf.shape
-            psf_flat = self.discrete_psf.flatten()
-            psf_flat = psf_flat / psf_flat.sum()
-            sampled_indices = torch.multinomial(psf_flat, sampling_budget, replacement=True)
-
-            d, h, w = psf_shape
-            z_idx = sampled_indices // (h * w)
-            y_idx = (sampled_indices % (h * w)) // w
-            x_idx = sampled_indices % w
-            offsets = torch.stack([
-                z_idx.float() - (d - 1) / 2.0,
-                y_idx.float() - (h - 1) / 2.0,
-                x_idx.float() - (w - 1) / 2.0,
-            ], dim=1)
-
-        return offsets
-
     def __getitem__(self, idx):
         target_coords = sample_random_coords(self.num_pixels_per_step, self.volume_shape)
 
-        # Convert to numpy indices for memory-mapped array access (avoids loading full volume)
         z_idx = target_coords[:, 0].numpy()
         y_idx = target_coords[:, 1].numpy()
         x_idx = target_coords[:, 2].numpy()
         values = self.norm_volume_tensor[z_idx, y_idx, x_idx]
-        # Ensure native byte order, normalize to [0, 1] on the small batch only
         target_values = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)) / 65535.0
 
-        sampled_offsets = self._generate_offsets()
         target_coords_normalized = target_coords.float() * self.inv_shape
-        sampled_offsets_normalized = sampled_offsets.float() * self.inv_shape
 
         return {
-            'target_coords': target_coords_normalized,
-            'target_values': target_values,
-            'sampled_offsets': sampled_offsets_normalized,
+            'target_coords': target_coords_normalized,   # (P, 3)  ~1.2 MB
+            'target_values': target_values,              # (P,)    ~0.4 MB
         }
+
+
+def generate_offsets_on_gpu(
+    n: int,
+    discrete_psf: torch.Tensor,
+    device: torch.device,
+    gmm_psf: GMMPsf = None,
+) -> torch.Tensor:
+    """
+    Generate n PSF offset samples directly on the GPU.
+
+    discrete mode : torch.multinomial on the GPU PSF tensor (integer offsets).
+    GMM mode      : GMMPsf.sample_gpu (continuous sub-pixel offsets).
+
+    Returns
+    -------
+    offsets : torch.Tensor, shape (n, 3), float32, on *device*
+        Pixel-unit offsets centred at the PSF origin.
+    """
+    if gmm_psf is not None:
+        return gmm_psf.sample_gpu(n, device)
+
+    # ── Discrete branch ──────────────────────────────────────────────────
+    psf_flat = discrete_psf.flatten()
+    psf_flat = psf_flat / psf_flat.sum()
+    idx = torch.multinomial(psf_flat, n, replacement=True)
+    d, h, w = discrete_psf.shape
+    z_idx = idx // (h * w)
+    y_idx = (idx % (h * w)) // w
+    x_idx = idx % w
+    return torch.stack([
+        z_idx.float() - (d - 1) / 2.0,
+        y_idx.float() - (h - 1) / 2.0,
+        x_idx.float() - (w - 1) / 2.0,
+    ], dim=1)
 
 
 def psf_uniform_sampling_step(
@@ -93,15 +99,26 @@ def psf_uniform_sampling_step(
     batch: dict,
     num_mc_samples: int,
     device: torch.device,
+    discrete_psf: torch.Tensor,
+    inv_shape: torch.Tensor,
+    gmm_psf: GMMPsf = None,
     stochastic_alpha: float = 0.0,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
-    sampled_offsets = batch['sampled_offsets'].to(device, non_blocking=True)
 
     num_pixels = target_coords.shape[0]
     n_dims = target_coords.shape[1]
-    sampled_offsets = sampled_offsets.view(num_pixels, num_mc_samples, n_dims)
+    sampling_budget = num_pixels * num_mc_samples
+
+    # Generate offsets on GPU — no 120 MB CPU→GPU transfer per step
+    sampled_offsets = generate_offsets_on_gpu(
+        sampling_budget, discrete_psf=discrete_psf, device=device, gmm_psf=gmm_psf,
+    )  # (N, n_dims), pixel units
+
+    # Normalise to [0,1] coordinate space (same as target_coords)
+    inv_shape_gpu = inv_shape.to(device, non_blocking=True)
+    sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
 
     source_coords = target_coords.unsqueeze(1) + sampled_offsets
     source_coords = torch.clamp(source_coords, 0.0, 1.0)
@@ -111,9 +128,7 @@ def psf_uniform_sampling_step(
         source_coords_flat[:, 2],
         source_coords_flat[:, 1],
         source_coords_flat[:, 0],
-    ], dim=-1)
-
-    coords_for_model = coords_for_model.float()
+    ], dim=-1).float()
     coords_for_model.requires_grad_(False)
 
     pred_flat, _ = model(coords_for_model, variance=None, stochastic_alpha=stochastic_alpha)
@@ -132,7 +147,9 @@ def psf_uniform_sampling_step(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--volume_tif", type=str, default="/workspace/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
-    parser.add_argument("--psf_path", type=str, default="/workspace/psf_t0_v0.tif")
+    parser.add_argument("--psf_path", type=str, default=None,
+                        help="Path to discrete PSF file (.tif/.tiff/.npy). "
+                             "Required for 'discrete' mode or 'gmm' without --gmm_checkpoint.")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--save_path", type=str, default="../checkpoints/lsm_mouse_heart_constantLR.pth")
@@ -160,20 +177,9 @@ def main():
 
     # PSF sampling mode
     parser.add_argument("--psf_mode", type=str, default="discrete", choices=["discrete", "gmm"],
-                        help="PSF sampling mode: 'discrete' (multinomial integer offsets) "
-                             "or 'gmm' (Gaussian Mixture Model continuous offsets)")
-    parser.add_argument("--gmm_components", type=int, default=64,
-                        help="[GMM mode] Number of Gaussian components")
-    parser.add_argument("--gmm_covariance_type", type=str, default="full",
-                        choices=["full", "diag", "tied", "spherical"],
-                        help="[GMM mode] Covariance type for GaussianMixture")
-    parser.add_argument("--gmm_max_iter", type=int, default=500,
-                        help="[GMM mode] Maximum EM iterations when fitting GMM")
-    parser.add_argument("--gmm_n_init", type=int, default=3,
-                        help="[GMM mode] Number of EM initialisations (best kept)")
+                        help="PSF sampling mode: 'discrete' or 'gmm'")
     parser.add_argument("--gmm_checkpoint", type=str, default=None,
-                        help="[GMM mode] Path to a pre-fitted GMMPsf .pkl file. "
-                             "If not set, the GMM is fitted from --psf_path before training.")
+                        help="[gmm mode] Path to a pre-fitted GMMPsf .pkl file (from gmm_psf.py).")
 
     args = parser.parse_args()
 
@@ -240,20 +246,23 @@ def main():
         total_nodes += nodes
     print(f"  Total hashgrid nodes: {total_nodes:,}")
 
-    # Load PSF
-    if args.psf_path.endswith(".tif") or args.psf_path.endswith(".tiff"):
-        discrete_psf_np = tifffile.imread(args.psf_path).astype(np.float32)
-    elif args.psf_path.endswith(".npy"):
-        discrete_psf_np = np.load(args.psf_path).astype(np.float32)
+    # ── Load PSF ───────────────────────────────────────────────────────
+    if args.psf_mode == "discrete":
+        if args.psf_path is None:
+            raise ValueError("--psf_path is required for discrete mode.")
+        if args.psf_path.endswith((".tif", ".tiff")):
+            discrete_psf_np = tifffile.imread(args.psf_path).astype(np.float32)
+        elif args.psf_path.endswith(".npy"):
+            discrete_psf_np = np.load(args.psf_path).astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported PSF format: {args.psf_path}")
+        discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
+        print(f"Discrete PSF: shape={discrete_psf.shape}, "
+              f"range=[{discrete_psf.min():.4f}, {discrete_psf.max():.4f}]")
+        if len(discrete_psf.shape) != n_dims:
+            raise ValueError(f"PSF dims {len(discrete_psf.shape)} != volume dims {n_dims}")
     else:
-        raise ValueError(f"Unsupported PSF file format: {args.psf_path}. Expected .tif, .tiff, or .npy")
-
-    discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
-    print(f"Discrete PSF shape: {discrete_psf.shape}")
-    print(f"Discrete PSF min: {discrete_psf.min():.6f}, max: {discrete_psf.max():.6f}")
-
-    if len(discrete_psf.shape) != n_dims:
-        raise ValueError(f"Discrete PSF dimensions {len(discrete_psf.shape)} does not match data dimensions {n_dims}D")
+        discrete_psf = None
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
@@ -263,35 +272,24 @@ def main():
     # ── PSF sampling mode setup ──────────────────────────────────────────
     gmm_psf = None
     if args.psf_mode == "gmm":
-        if args.gmm_checkpoint is not None and os.path.isfile(args.gmm_checkpoint):
-            print(f"Loading pre-fitted GMM PSF from {args.gmm_checkpoint}")
-            gmm_psf = GMMPsf.load(args.gmm_checkpoint)
-        else:
-            print("Fitting GMM PSF from discrete PSF ...")
-            gmm_psf = GMMPsf.from_discrete_psf(
-                psf=discrete_psf_np,
-                n_components=args.gmm_components,
-                covariance_type=args.gmm_covariance_type,
-                max_iter=args.gmm_max_iter,
-                n_init=args.gmm_n_init,
-                verbose=True,
-            )
-            # Auto-save alongside the volume checkpoint
-            gmm_save_path = args.save_path.replace(".pth", "_gmm.pkl")
-            gmm_psf.save(gmm_save_path)
-        print(f"PSF mode: GMM  (K={gmm_psf.n_components} components, "
-              f"covariance={gmm_psf.gmm.covariance_type})")
+        if not args.gmm_checkpoint:
+            raise ValueError("--gmm_checkpoint is required for gmm mode. "
+                             "Run gmm_psf.py first to fit and save the GMM.")
+        gmm_psf = GMMPsf.load(args.gmm_checkpoint)
+        print(f"PSF mode: GMM  (K={gmm_psf.n_components}, cov={gmm_psf.gmm.covariance_type})")
     else:
         print("PSF mode: discrete (multinomial integer offsets)")
 
+    # Pre-cache GMM tensors on GPU to avoid repeated CPU→GPU copies
+    if gmm_psf is not None:
+        gmm_psf.prepare_gpu(device)
+
     dataset = VolumeDataset(
-        norm_volume_tensor=vol_norm,  # numpy memmap — NOT converted to tensor
-        num_mc_samples=args.num_mc_samples,
+        norm_volume_tensor=vol_norm,
         num_pixels_per_step=args.num_pixels_per_step,
         num_batches=args.steps,
-        discrete_psf=discrete_psf,
-        gmm_psf=gmm_psf,
     )
+    inv_shape = dataset.inv_shape  # keep a reference for the training step
 
     dataloader = DataLoader(
         dataset,
@@ -346,6 +344,9 @@ def main():
             batch=batch,
             num_mc_samples=args.num_mc_samples,
             device=device,
+            discrete_psf=discrete_psf,
+            inv_shape=inv_shape,
+            gmm_psf=gmm_psf,
             stochastic_alpha=current_alpha,
         )
 
