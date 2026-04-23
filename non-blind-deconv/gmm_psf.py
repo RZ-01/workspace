@@ -114,8 +114,8 @@ class GMMPsf:
         # We use n_samples proportional to the number of non-zero pixels so
         # that the GMM has enough data to represent fine structure.
         n_nonzero = int((weights > 0).sum())
-        n_samples = max(100_000, n_nonzero * 10)
-        n_samples = min(n_samples, 2_000_000)   # cap to avoid OOM
+        n_samples = max(200_000, n_nonzero * 20)
+        n_samples = min(n_samples, 5_000_000)   # cap to avoid OOM
 
         if verbose:
             print(f"PSF shape: {psf_shape}, n_dims: {n_dims}")
@@ -126,10 +126,20 @@ class GMMPsf:
         sample_idx = rng.choice(len(coords), size=n_samples, replace=True, p=weights)
         X = coords[sample_idx]   # (n_samples, n_dims)
 
+        # --- PSF-weighted initialisation of component means ---
+        # Draw n_components positions from the PSF distribution so that every
+        # Gaussian component starts inside a bright region.  This prevents
+        # components from being wasted on dark background and greatly improves
+        # convergence compared to the default k-means random initialisation.
+        n_init_pts = min(n_components, n_nonzero)
+        init_idx = rng.choice(len(coords), size=n_init_pts, replace=False, p=weights)
+        means_init = coords[init_idx]   # (n_components, n_dims)
+
         if verbose:
             print(
                 f"Fitting GMM: n_components={n_components}, "
-                f"covariance_type={covariance_type}, n_init={n_init} ..."
+                f"covariance_type={covariance_type}, n_init={n_init}\n"
+                f"  PSF-weighted means_init: all {n_init_pts} components seeded in bright regions."
             )
 
         gmm = GaussianMixture(
@@ -137,6 +147,8 @@ class GMMPsf:
             covariance_type=covariance_type,
             max_iter=max_iter,
             n_init=n_init,
+            means_init=means_init,
+            init_params="random",   # weights & covariances random; means fixed above
             random_state=random_state,
             verbose=2 if verbose else 0,
             verbose_interval=50,
