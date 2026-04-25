@@ -1,41 +1,43 @@
 import argparse
 import os
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tifffile
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from models.instantngp import InstantNGPTorchModel
-from sample_strategy.random_sample import sample_random_coords
 from gmm_psf import GMMPsf
 
 
-class VolumeDataset(Dataset):
+class ImageDataset(Dataset):
     """
-    Provides (target_coords, target_values) batches from the volume.
+    Provides (target_coords, target_values) batches from a 2D image.
 
     PSF offset generation has been moved to the GPU training step
     (see generate_offsets_on_gpu) to eliminate a large CPU→GPU transfer.
     """
     def __init__(
         self,
-        norm_volume_tensor,
+        norm_image_tensor,
         num_pixels_per_step,
         num_batches,
     ):
-        self.norm_volume_tensor = norm_volume_tensor
+        self.norm_image_tensor = norm_image_tensor
         self.num_pixels_per_step = num_pixels_per_step
         self.num_batches = num_batches
-        self.volume_shape = norm_volume_tensor.shape
+        self.image_shape = norm_image_tensor.shape
 
-        vz, vy, vx = self.volume_shape
+        if len(self.image_shape) != 2:
+            raise ValueError(f"Only 2D images are supported, got shape={self.image_shape}")
+
+        h, w = self.image_shape
         self.inv_shape = torch.tensor(
-            [1.0 / (vz - 1), 1.0 / (vy - 1), 1.0 / (vx - 1)],
+            [1.0 / max(h - 1, 1), 1.0 / max(w - 1, 1)],
             dtype=torch.float32,
         )
 
@@ -43,18 +45,20 @@ class VolumeDataset(Dataset):
         return self.num_batches
 
     def __getitem__(self, idx):
-        target_coords = sample_random_coords(self.num_pixels_per_step, self.volume_shape)
+        h, w = self.image_shape
+        y_idx_t = torch.randint(0, h, (self.num_pixels_per_step,))
+        x_idx_t = torch.randint(0, w, (self.num_pixels_per_step,))
+        target_coords = torch.stack([y_idx_t, x_idx_t], dim=1)
 
-        z_idx = target_coords[:, 0].numpy()
-        y_idx = target_coords[:, 1].numpy()
-        x_idx = target_coords[:, 2].numpy()
-        values = self.norm_volume_tensor[z_idx, y_idx, x_idx]
-        target_values = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)) / 65535.0
+        y_idx = target_coords[:, 0].numpy()
+        x_idx = target_coords[:, 1].numpy()
+        values = self.norm_image_tensor[y_idx, x_idx]
+        target_values = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
 
         target_coords_normalized = target_coords.float() * self.inv_shape
 
         return {
-            'target_coords': target_coords_normalized,   # (P, 3)  ~1.2 MB
+            'target_coords': target_coords_normalized,   # (P, 2)
             'target_values': target_values,              # (P,)    ~0.4 MB
         }
 
@@ -68,12 +72,12 @@ def generate_offsets_on_gpu(
     """
     Generate n PSF offset samples directly on the GPU.
 
-    discrete mode : torch.multinomial on the GPU PSF tensor (integer offsets).
+    discrete mode : torch.multinomial on the GPU PSF tensor (integer offsets, 2D).
     GMM mode      : GMMPsf.sample_gpu (continuous sub-pixel offsets).
 
     Returns
     -------
-    offsets : torch.Tensor, shape (n, 3), float32, on *device*
+    offsets : torch.Tensor, shape (n, 2), float32, on *device*
         Pixel-unit offsets centred at the PSF origin.
     """
     if gmm_psf is not None:
@@ -83,12 +87,10 @@ def generate_offsets_on_gpu(
     psf_flat = discrete_psf.flatten()
     psf_flat = psf_flat / psf_flat.sum()
     idx = torch.multinomial(psf_flat, n, replacement=True)
-    d, h, w = discrete_psf.shape
-    z_idx = idx // (h * w)
-    y_idx = (idx % (h * w)) // w
+    h, w = discrete_psf.shape
+    y_idx = idx // w
     x_idx = idx % w
     return torch.stack([
-        z_idx.float() - (d - 1) / 2.0,
         y_idx.float() - (h - 1) / 2.0,
         x_idx.float() - (w - 1) / 2.0,
     ], dim=1)
@@ -109,7 +111,7 @@ def compute_gradient_losses(
 
     Inputs
     ------
-    coords : (N, 3), float32, on GPU, normalised [0,1] in (z, y, x) order.
+    coords : (N, 2), float32, on GPU, normalised [0,1] in (y, x) order.
              Reuses target_coords already resident on GPU — zero extra CPU→GPU cost.
     grad_sample_size : number of points to subsample from coords.
     fd_eps  : finite-difference step in normalised coordinate units (~1e-3).
@@ -121,44 +123,39 @@ def compute_gradient_losses(
 
     Gradient estimation cost
     ------------------------
-    4 model forwards over `grad_sample_size` points.
-    With grad_sample_size=50_000 and a 100K data-fidelity step the extra
-    compute is ~2% (4 × 50K / (100 + 4×50K) ≈ 2%).
+    3 model forwards over `grad_sample_size` points.
     """
     N = coords.shape[0]
 
     # ── Subsample from the already-resident target_coords ─────────────────
     if grad_sample_size < N:
         perm = torch.randperm(N, device=coords.device)[:grad_sample_size]
-        pts = coords[perm]                          # (S, 3) — detached view
+        pts = coords[perm]                          # (S, 2) — detached view
     else:
         pts = coords                                # use all
 
     # ── Build perturbed coordinate sets ──────────────────────────────────
-    # coords are (z, y, x); clamp to stay in [0, 1]
-    pts_z = torch.clamp(pts + torch.tensor([fd_eps, 0.0, 0.0], device=pts.device), 0.0, 1.0)
-    pts_y = torch.clamp(pts + torch.tensor([0.0, fd_eps, 0.0], device=pts.device), 0.0, 1.0)
-    pts_x = torch.clamp(pts + torch.tensor([0.0, 0.0, fd_eps], device=pts.device), 0.0, 1.0)
+    # coords are (y, x); clamp to stay in [0, 1]
+    pts_y = torch.clamp(pts + torch.tensor([fd_eps, 0.0], device=pts.device), 0.0, 1.0)
+    pts_x = torch.clamp(pts + torch.tensor([0.0, fd_eps], device=pts.device), 0.0, 1.0)
 
     def _forward(c):
-        # model expects (x, y, z) — swap from our (z, y, x) storage order
-        c_model = torch.stack([c[:, 2], c[:, 1], c[:, 0]], dim=-1).float()
+        # model expects (x, y) — swap from our (y, x) storage order
+        c_model = torch.stack([c[:, 1], c[:, 0]], dim=-1).float()
         pred, _ = model(c_model, variance=None, stochastic_alpha=stochastic_alpha)
         return pred   # (S,)
 
-    # ── 4 compact model forwards ──────────────────────────────────────────
+    # ── 3 compact model forwards ──────────────────────────────────────────
     val_c = _forward(pts)
-    val_z = _forward(pts_z)
     val_y = _forward(pts_y)
     val_x = _forward(pts_x)
 
-    dz = (val_z - val_c) / fd_eps
     dy = (val_y - val_c) / fd_eps
     dx = (val_x - val_c) / fd_eps
 
     # ── TV loss: L1 on each gradient component (isotropic L1-TV) ─────────
     # Minimising this suppresses noise-driven small gradients uniformly.
-    tv_loss = (dz.abs() + dy.abs() + dx.abs()).mean()
+    tv_loss = (dy.abs() + dx.abs()).mean()
 
     # ── Soft-L0 loss: sigmoid approximation of L0 gradient sparsity ───────
     # sigmoid(β·‖∇‖ − 1) ≈ 0 when ‖∇‖ ≈ 0  (flat region, no penalty)
@@ -166,7 +163,7 @@ def compute_gradient_losses(
     #                      ≈ 0.5 at ‖∇‖ = 1/β  (penalises the "mushy middle")
     # Minimising this drives gradients toward either 0 or large values —
     # exactly the polarisation needed for sharp edges.
-    grad_mag = torch.sqrt(dz ** 2 + dy ** 2 + dx ** 2 + 1e-8)
+    grad_mag = torch.sqrt(dy ** 2 + dx ** 2 + 1e-8)
     l0_loss = torch.sigmoid(l0_beta * grad_mag - 1.0).mean()
 
     return tv_loss, l0_loss
@@ -209,7 +206,6 @@ def psf_uniform_sampling_step(
     source_coords_flat = source_coords.view(-1, n_dims)
 
     coords_for_model = torch.stack([
-        source_coords_flat[:, 2],
         source_coords_flat[:, 1],
         source_coords_flat[:, 0],
     ], dim=-1).float()
@@ -231,7 +227,7 @@ def psf_uniform_sampling_step(
 
     # ── Sharpness regularisation (TV + soft-L0) ───────────────────────────
     # Both terms reuse target_coords already on GPU — no extra data transfer.
-    # Cost: 4 model forwards over grad_sample_size points (~2% overhead at 50K).
+    # Cost: 3 model forwards over grad_sample_size points.
     if lambda_tv > 0.0 or lambda_l0 > 0.0:
         tv_loss, l0_loss = compute_gradient_losses(
             model=model,
@@ -256,9 +252,9 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--volume_tif", type=str, default="/workspace/temp/workspace/non-blind-deconv/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
+    parser.add_argument("--image_path", type=str, default="/workspace/temp/workspace/non-blind-deconv/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
     parser.add_argument("--psf_path", type=str, default="/workspace/temp/workspace/psf_t0_v0.tif",
-                        help="Path to discrete PSF file (.tif/.tiff/.npy). "
+                        help="Path to discrete 2D PSF file (image or .npy). "
                              "Required for 'discrete' mode or 'gmm' without --gmm_checkpoint.")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=1e-2)
@@ -300,10 +296,10 @@ def main():
                              "0-or-large, sharpening edges. Suggested range: 1e-3 ~ 1e-1. "
                              "Default 0 (disabled).")
     parser.add_argument("--grad_sample_size", type=int, default=50_000,
-                        help="Points subsampled from target_coords for gradient estimation. )
+                        help="Points subsampled from target_coords for gradient estimation.")
     parser.add_argument("--fd_eps", type=float, default=1e-3,
                         help="Finite-difference step size in normalised [0,1] coordinates. "
-                             "~1e-3 ≈ 1 voxel for a 1000-voxel axis.")
+                            "~1e-3 is roughly one pixel for a 1000-pixel axis.")
     parser.add_argument("--l0_beta", type=float, default=10.0,
                         help="Temperature for soft-L0 sigmoid. Higher = harder threshold. "
                              "Threshold sits at grad_mag = 1/beta (default: 0.1 normalised units).")
@@ -319,16 +315,24 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    try:
-        vol_norm = tifffile.memmap(args.volume_tif, mode='r')
-        print(f"Volume memory-mapped: shape={vol_norm.shape}, dtype={vol_norm.dtype}")
-    except (ValueError, NotImplementedError):
-        print("WARNING: tifffile.memmap not supported for this file (likely compressed). ")
-        print("Falling back to full load — consider converting to uncompressed TIFF or .npy.")
-        vol_norm = tifffile.imread(args.volume_tif)  # numpy array, original dtype
-        print(f"Volume loaded: shape={vol_norm.shape}, dtype={vol_norm.dtype}")
+    image = cv2.imread(args.image_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f"Failed to read image: {args.image_path}")
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if image.ndim != 2:
+        raise ValueError(f"Only 2D images are supported, got shape={image.shape}")
 
-    n_dims = len(vol_norm.shape)
+    if np.issubdtype(image.dtype, np.integer):
+        image_norm = image.astype(np.float32) / float(np.iinfo(image.dtype).max)
+    else:
+        image_norm = image.astype(np.float32)
+        max_val = float(np.max(image_norm)) if image_norm.size > 0 else 1.0
+        if max_val > 1.0:
+            image_norm = image_norm / max_val
+
+    print(f"Image loaded: shape={image_norm.shape}, dtype={image_norm.dtype}")
+    n_dims = 2
 
     encoder_config = {
         "otype": "HashGrid",
@@ -372,7 +376,7 @@ def main():
     total_nodes = 0
     for i in range(n_levels):
         res = int(base * (per_level_scale ** i))
-        nodes = min(hashmap_max, res ** 3)
+        nodes = min(hashmap_max, res ** 2)
         total_nodes += nodes
     print(f"  Total hashgrid nodes: {total_nodes:,}")
 
@@ -380,17 +384,26 @@ def main():
     if args.psf_mode == "discrete":
         if args.psf_path is None:
             raise ValueError("--psf_path is required for discrete mode.")
-        if args.psf_path.endswith((".tif", ".tiff")):
-            discrete_psf_np = tifffile.imread(args.psf_path).astype(np.float32)
-        elif args.psf_path.endswith(".npy"):
+        if args.psf_path.endswith(".npy"):
             discrete_psf_np = np.load(args.psf_path).astype(np.float32)
         else:
-            raise ValueError(f"Unsupported PSF format: {args.psf_path}")
+            discrete_psf_np = cv2.imread(args.psf_path, cv2.IMREAD_UNCHANGED)
+            if discrete_psf_np is None:
+                raise ValueError(f"Unsupported or unreadable PSF format: {args.psf_path}")
+            if discrete_psf_np.ndim == 3:
+                discrete_psf_np = cv2.cvtColor(discrete_psf_np, cv2.COLOR_BGR2GRAY)
+            discrete_psf_np = discrete_psf_np.astype(np.float32)
+        if discrete_psf_np.ndim != 2:
+            raise ValueError(f"Only 2D PSF is supported, got shape={discrete_psf_np.shape}")
+        psf_sum = float(discrete_psf_np.sum())
+        if psf_sum <= 0:
+            raise ValueError("PSF sum must be positive.")
+        discrete_psf_np = discrete_psf_np / psf_sum
         discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
         print(f"Discrete PSF: shape={discrete_psf.shape}, "
               f"range=[{discrete_psf.min():.4f}, {discrete_psf.max():.4f}]")
         if len(discrete_psf.shape) != n_dims:
-            raise ValueError(f"PSF dims {len(discrete_psf.shape)} != volume dims {n_dims}")
+            raise ValueError(f"PSF dims {len(discrete_psf.shape)} != image dims {n_dims}")
     else:
         discrete_psf = None
 
@@ -420,6 +433,8 @@ def main():
             raise ValueError("--gmm_checkpoint is required for gmm mode. "
                              "Run gmm_psf.py first to fit and save the GMM.")
         gmm_psf = GMMPsf.load(args.gmm_checkpoint)
+        if gmm_psf.n_dims != 2:
+            raise ValueError(f"Only 2D GMM PSF is supported, got n_dims={gmm_psf.n_dims}")
         print(f"PSF mode: GMM  (K={gmm_psf.n_components}, cov={gmm_psf.gmm.covariance_type})")
     else:
         print("PSF mode: discrete (multinomial integer offsets)")
@@ -428,8 +443,8 @@ def main():
     if gmm_psf is not None:
         gmm_psf.prepare_gpu(device)
 
-    dataset = VolumeDataset(
-        norm_volume_tensor=vol_norm,
+    dataset = ImageDataset(
+        norm_image_tensor=image_norm,
         num_pixels_per_step=args.num_pixels_per_step,
         num_batches=args.steps,
     )
