@@ -94,6 +94,84 @@ def generate_offsets_on_gpu(
     ], dim=1)
 
 
+def compute_gradient_losses(
+    model: nn.Module,
+    coords: torch.Tensor,
+    grad_sample_size: int,
+    fd_eps: float,
+    l0_beta: float,
+    stochastic_alpha: float = 0.0,
+) -> tuple:
+    """
+    Estimate INR spatial gradients via finite difference and compute:
+      - tv_loss  : L1-TV  (isotropic, penalises all gradients → suppresses noise)
+      - l0_loss  : soft-L0 (penalises small *non-zero* gradients → polarises edges)
+
+    Inputs
+    ------
+    coords : (N, 3), float32, on GPU, normalised [0,1] in (z, y, x) order.
+             Reuses target_coords already resident on GPU — zero extra CPU→GPU cost.
+    grad_sample_size : number of points to subsample from coords.
+    fd_eps  : finite-difference step in normalised coordinate units (~1e-3).
+    l0_beta : temperature for soft-L0 sigmoid (higher → harder threshold).
+
+    Returns
+    -------
+    (tv_loss, l0_loss) — both scalar tensors with gradients.
+
+    Gradient estimation cost
+    ------------------------
+    4 model forwards over `grad_sample_size` points.
+    With grad_sample_size=50_000 and a 100K data-fidelity step the extra
+    compute is ~2% (4 × 50K / (100 + 4×50K) ≈ 2%).
+    """
+    N = coords.shape[0]
+
+    # ── Subsample from the already-resident target_coords ─────────────────
+    if grad_sample_size < N:
+        perm = torch.randperm(N, device=coords.device)[:grad_sample_size]
+        pts = coords[perm]                          # (S, 3) — detached view
+    else:
+        pts = coords                                # use all
+
+    # ── Build perturbed coordinate sets ──────────────────────────────────
+    # coords are (z, y, x); clamp to stay in [0, 1]
+    pts_z = torch.clamp(pts + torch.tensor([fd_eps, 0.0, 0.0], device=pts.device), 0.0, 1.0)
+    pts_y = torch.clamp(pts + torch.tensor([0.0, fd_eps, 0.0], device=pts.device), 0.0, 1.0)
+    pts_x = torch.clamp(pts + torch.tensor([0.0, 0.0, fd_eps], device=pts.device), 0.0, 1.0)
+
+    def _forward(c):
+        # model expects (x, y, z) — swap from our (z, y, x) storage order
+        c_model = torch.stack([c[:, 2], c[:, 1], c[:, 0]], dim=-1).float()
+        pred, _ = model(c_model, variance=None, stochastic_alpha=stochastic_alpha)
+        return pred   # (S,)
+
+    # ── 4 compact model forwards ──────────────────────────────────────────
+    val_c = _forward(pts)
+    val_z = _forward(pts_z)
+    val_y = _forward(pts_y)
+    val_x = _forward(pts_x)
+
+    dz = (val_z - val_c) / fd_eps
+    dy = (val_y - val_c) / fd_eps
+    dx = (val_x - val_c) / fd_eps
+
+    # ── TV loss: L1 on each gradient component (isotropic L1-TV) ─────────
+    # Minimising this suppresses noise-driven small gradients uniformly.
+    tv_loss = (dz.abs() + dy.abs() + dx.abs()).mean()
+
+    # ── Soft-L0 loss: sigmoid approximation of L0 gradient sparsity ───────
+    # sigmoid(β·‖∇‖ − 1) ≈ 0 when ‖∇‖ ≈ 0  (flat region, no penalty)
+    #                      ≈ 1 when ‖∇‖ >> 1/β  (large gradient, no penalty)
+    #                      ≈ 0.5 at ‖∇‖ = 1/β  (penalises the "mushy middle")
+    # Minimising this drives gradients toward either 0 or large values —
+    # exactly the polarisation needed for sharp edges.
+    grad_mag = torch.sqrt(dz ** 2 + dy ** 2 + dx ** 2 + 1e-8)
+    l0_loss = torch.sigmoid(l0_beta * grad_mag - 1.0).mean()
+
+    return tv_loss, l0_loss
+
+
 def psf_uniform_sampling_step(
     model: nn.Module,
     batch: dict,
@@ -103,6 +181,12 @@ def psf_uniform_sampling_step(
     inv_shape: torch.Tensor,
     gmm_psf: GMMPsf = None,
     stochastic_alpha: float = 0.0,
+    # ── sharpness regularisation ─────────────────────────────────────────
+    lambda_tv: float = 0.0,
+    lambda_l0: float = 0.0,
+    grad_sample_size: int = 50_000,
+    fd_eps: float = 1e-3,
+    l0_beta: float = 10.0,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
@@ -138,10 +222,36 @@ def psf_uniform_sampling_step(
     data_loss = F.mse_loss(simulated_values.float(), target_values.float())
     total_loss = data_loss * 100
 
-    return {
+    result = {
         "reconstruction_loss": data_loss * 100,
+        "tv_loss": torch.zeros(1, device=device),
+        "l0_loss": torch.zeros(1, device=device),
         "total_loss": total_loss,
     }
+
+    # ── Sharpness regularisation (TV + soft-L0) ───────────────────────────
+    # Both terms reuse target_coords already on GPU — no extra data transfer.
+    # Cost: 4 model forwards over grad_sample_size points (~2% overhead at 50K).
+    if lambda_tv > 0.0 or lambda_l0 > 0.0:
+        tv_loss, l0_loss = compute_gradient_losses(
+            model=model,
+            coords=target_coords,
+            grad_sample_size=grad_sample_size,
+            fd_eps=fd_eps,
+            l0_beta=l0_beta,
+            stochastic_alpha=stochastic_alpha,
+        )
+
+        if lambda_tv > 0.0:
+            total_loss = total_loss + lambda_tv * tv_loss
+            result["tv_loss"] = tv_loss
+
+        if lambda_l0 > 0.0:
+            total_loss = total_loss + lambda_l0 * l0_loss
+            result["l0_loss"] = l0_loss
+
+    result["total_loss"] = total_loss
+    return result
 
 
 def main():
@@ -180,6 +290,27 @@ def main():
                         help="PSF sampling mode: 'discrete' or 'gmm'")
     parser.add_argument("--gmm_checkpoint", type=str, default=None,
                         help="[gmm mode] Path to a pre-fitted GMMPsf .pkl file (from gmm_psf.py).")
+
+    # ── Sharpness regularisation ──────────────────────────────────────────
+    parser.add_argument("--lambda_tv", type=float, default=1e-5,
+                        help="Weight for L1-TV loss. Suppresses noise-driven small gradients. "
+                             "Suggested starting range: 1e-4 ~ 1e-2. Default 0 (disabled).")
+    parser.add_argument("--lambda_l0", type=float, default=1e-3,
+                        help="Weight for soft-L0 gradient loss. Polarises gradients toward "
+                             "0-or-large, sharpening edges. Suggested range: 1e-3 ~ 1e-1. "
+                             "Default 0 (disabled).")
+    parser.add_argument("--grad_sample_size", type=int, default=50_000,
+                        help="Points subsampled from target_coords for gradient estimation. "
+                             "50K adds ~2%% compute overhead. No extra CPU→GPU transfer.")
+    parser.add_argument("--fd_eps", type=float, default=1e-3,
+                        help="Finite-difference step size in normalised [0,1] coordinates. "
+                             "~1e-3 ≈ 1 voxel for a 1000-voxel axis.")
+    parser.add_argument("--l0_beta", type=float, default=10.0,
+                        help="Temperature for soft-L0 sigmoid. Higher = harder threshold. "
+                             "Threshold sits at grad_mag = 1/beta (default: 0.1 normalised units).")
+    parser.add_argument("--reg_warmup_fraction", type=float, default=0.3,
+                        help="Fraction of total steps before regularisation is switched on. "
+                             "E.g. 0.3 means TV+L0 start at 30%% of training. Default 0 (always on).")
 
     args = parser.parse_args()
 
@@ -265,9 +396,23 @@ def main():
         discrete_psf = None
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
-    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
     scaler = GradScaler()
     writer = SummaryWriter(log_dir=args.logdir)
+
+    # ── Regularisation config summary ────────────────────────────────────
+    reg_enabled = args.lambda_tv > 0.0 or args.lambda_l0 > 0.0
+    reg_warmup_step = int(args.steps * args.reg_warmup_fraction)
+    if reg_enabled:
+        print(f"\nSharpness regularisation enabled:")
+        print(f"  lambda_tv={args.lambda_tv}  lambda_l0={args.lambda_l0}")
+        print(f"  grad_sample_size={args.grad_sample_size}  fd_eps={args.fd_eps}  l0_beta={args.l0_beta}")
+        if reg_warmup_step > 0:
+            print(f"  Warm-up: regularisation activates at step {reg_warmup_step} "
+                  f"({args.reg_warmup_fraction*100:.0f}% of training)")
+    else:
+        print("\nSharpness regularisation disabled (lambda_tv=0, lambda_l0=0). "
+              "Pass --lambda_tv / --lambda_l0 to enable.")
 
     # ── PSF sampling mode setup ──────────────────────────────────────────
     gmm_psf = None
@@ -339,6 +484,10 @@ def main():
         else:
             current_alpha = 0.0
 
+        # Disable regularisation until warm-up step is reached
+        step_lambda_tv = args.lambda_tv if step >= reg_warmup_step else 0.0
+        step_lambda_l0 = args.lambda_l0 if step >= reg_warmup_step else 0.0
+
         loss_dict = psf_uniform_sampling_step(
             model=model,
             batch=batch,
@@ -348,6 +497,11 @@ def main():
             inv_shape=inv_shape,
             gmm_psf=gmm_psf,
             stochastic_alpha=current_alpha,
+            lambda_tv=step_lambda_tv,
+            lambda_l0=step_lambda_l0,
+            grad_sample_size=args.grad_sample_size,
+            fd_eps=args.fd_eps,
+            l0_beta=args.l0_beta,
         )
 
         for key, value in loss_dict.items():
@@ -362,7 +516,7 @@ def main():
         scaler.update()
 
         current_lr = optimizer.param_groups[0]['lr']
-        #scheduler.step()
+        scheduler.step()
         writer.add_scalar("train/LearningRate", current_lr, step)
         writer.add_scalar("train/GradNorm", grad_norm.item(), step)
         writer.add_scalar("train/GradClipped", float(grad_norm > 100.0), step)
@@ -371,6 +525,11 @@ def main():
         postfix_dict = {
             'recon_loss': f'{loss_dict["reconstruction_loss"].item():.6f}',
         }
+        if reg_enabled and step >= reg_warmup_step:
+            if args.lambda_tv > 0.0:
+                postfix_dict['tv'] = f'{loss_dict["tv_loss"].item():.4f}'
+            if args.lambda_l0 > 0.0:
+                postfix_dict['l0'] = f'{loss_dict["l0_loss"].item():.4f}'
         if current_alpha > 1e-5:
             postfix_dict['sp_alpha'] = f'{current_alpha:.4f}'
         pbar.set_postfix(postfix_dict)

@@ -7,6 +7,7 @@ import torch
 import tifffile
 from scipy.signal import fftconvolve
 from tqdm import tqdm
+import matplotlib.pyplot as plt  # [新增] 导入 matplotlib
 
 from models.instantngp import InstantNGPTorchModel
 
@@ -51,13 +52,22 @@ def choose_slices(dz: int, num_slices: int, seed: int, mode: str) -> List[int]:
     else:
         raise ValueError(f"Unknown slice_mode: {mode}")
 
+# [新增] 用于图像归一化的辅助函数
+def normalize_image(img: np.ndarray) -> np.ndarray:
+    """Min-Max 归一化，将图像像素值拉伸到 [0, 1] 之间以便可视化"""
+    img_min = img.min()
+    img_max = img.max()
+    if img_max > img_min:
+        return (img - img_min) / (img_max - img_min)
+    return img
+
 
 def main():
     parser = argparse.ArgumentParser(description="Infer z-slices from a trained Instant-NGP network and save as float32 TIF")
-    parser.add_argument("--volume_tif",  type=str, default="/workspace/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
-    parser.add_argument("--checkpoint",  type=str, default="/workspace/checkpoints/lsm_mouse_heart_constantLR.pth")
-    parser.add_argument("--psf_path",    type=str, default="/workspace/psf_t0_v0.tif")
-    parser.add_argument("--out_dir",     type=str, default="/workspace/inference/")
+    parser.add_argument("--volume_tif",  type=str, default="/workspace/temp/workspace/non-blind-deconv/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
+    parser.add_argument("--checkpoint",  type=str, default="/workspace/temp/workspace/checkpoints/lsm_deconv_gmm_reg.pth")
+    parser.add_argument("--psf_path",    type=str, default="/workspace/temp/workspace/psf_t0_v0.tif")
+    parser.add_argument("--out_dir",     type=str, default="/workspace/temp/workspace/inference/")
     parser.add_argument("--num_slices",  type=int, default=1)
     parser.add_argument("--device",      type=str, default="cuda")
     parser.add_argument("--seed",        type=int, default=42)
@@ -141,6 +151,29 @@ def main():
             blurred_path = os.path.join(args.out_dir, f"{checkpoint_tag}_blurred_z{z_idx:05d}.tif")
             tifffile.imwrite(blurred_path, blurred_out)
             print(f"  Saved blurred: {blurred_path}  range=[{blurred_out.min():.1f}, {blurred_out.max():.1f}]")
+
+            # ── [新增] 归一化并保存为并排比较的 PDF ────────────────────────────
+            print("  Generating comparison PDF...")
+            clear_norm = normalize_image(clear_slice)
+            blurred_norm = normalize_image(blurred_slice)
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+            
+            # 左侧：Clear (Deconvolved)
+            axes[0].imshow(clear_norm, cmap='gray')
+            axes[0].set_title(f"Clear Slice (z={z_idx})")
+            axes[0].axis('off')
+
+            # 右侧：Blurred (Convolved with PSF)
+            axes[1].imshow(blurred_norm, cmap='gray')
+            axes[1].set_title(f"Blurred Slice (z={z_idx})")
+            axes[1].axis('off')
+
+            plt.tight_layout()
+            pdf_path = os.path.join(args.out_dir, f"{checkpoint_tag}_comparison_z{z_idx:05d}.pdf")
+            plt.savefig(pdf_path, format='pdf', bbox_inches='tight')
+            plt.close(fig)  # 关闭图像防止内存泄漏
+            print(f"  Saved comparison PDF: {pdf_path}")
 
 
 if __name__ == "__main__":

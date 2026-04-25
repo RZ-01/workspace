@@ -602,7 +602,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fit a Gaussian Mixture Model to a discrete PSF for continuous sampling."
     )
-    parser.add_argument("--psf_path", type=str, required=True,
+    parser.add_argument("--psf_path", type=str, default="/workspace/temp/workspace/psf_t0_v0.tif",
                         help="Path to discrete PSF file (.tif, .tiff, or .npy)")
     parser.add_argument("--output_path", type=str, default="../checkpoints/psf_gmm.pkl",
                         help="Path to save the fitted GMM PSF (.pkl)")
