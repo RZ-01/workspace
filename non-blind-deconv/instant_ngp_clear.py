@@ -146,8 +146,8 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--volume_tif", type=str, default="/workspace/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
-    parser.add_argument("--psf_path", type=str, default=None,
+    parser.add_argument("--volume_tif", type=str, default="/workspace/temp/workspace/non-blind-deconv/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
+    parser.add_argument("--psf_path", type=str, default="/workspace/temp/workspace/psf_t0_v0.tif",
                         help="Path to discrete PSF file (.tif/.tiff/.npy). "
                              "Required for 'discrete' mode or 'gmm' without --gmm_checkpoint.")
     parser.add_argument("--steps", type=int, default=10000)
@@ -155,7 +155,7 @@ def main():
     parser.add_argument("--save_path", type=str, default="../checkpoints/lsm_mouse_heart_constantLR.pth")
     parser.add_argument("--logdir", type=str, default="../runs/lsm_mouse_heart_constantLR")
     parser.add_argument("--num_mc_samples", type=int, default=100, help="Number of PSF samples per pixel")
-    parser.add_argument("--num_pixels_per_step", type=int, default=100000, help="Number of pixels per step")
+    parser.add_argument("--num_pixels_per_step", type=int, default=180000, help="Number of pixels per step")
     parser.add_argument("--progressive_steps", type=int, default=1000, help="Number of steps to unlock progressively")
 
     # Stochastic training params
