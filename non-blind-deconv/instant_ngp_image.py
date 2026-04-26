@@ -252,17 +252,17 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/temp/workspace/non-blind-deconv/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
-    parser.add_argument("--psf_path", type=str, default="/workspace/temp/workspace/psf_t0_v0.tif",
+    parser.add_argument("--image_path", type=str, default="/workspace/temp/W_DIP/datasets/levin/blur/im1_kernel1_img.png")
+    parser.add_argument("--psf_path", type=str, default=None,
                         help="Path to discrete 2D PSF file (image or .npy). "
                              "Required for 'discrete' mode or 'gmm' without --gmm_checkpoint.")
-    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/lsm_mouse_heart_constantLR.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/lsm_mouse_heart_constantLR")
+    parser.add_argument("--save_path", type=str, default="../checkpoints/im1_kernel1_img.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/im1_kernel1_img")
     parser.add_argument("--num_mc_samples", type=int, default=100, help="Number of PSF samples per pixel")
     parser.add_argument("--num_pixels_per_step", type=int, default=180000, help="Number of pixels per step")
-    parser.add_argument("--progressive_steps", type=int, default=1000, help="Number of steps to unlock progressively")
+    parser.add_argument("--progressive_steps", type=int, default=300, help="Number of steps to unlock progressively")
 
     # Stochastic training params
     parser.add_argument("--sp_alpha_init", type=float, default=0.03,
@@ -271,20 +271,20 @@ def main():
                         help="Fraction of training steps over which to decay alpha to 0 (Paper suggests ~1/3)")
 
     # Encoder config
-    parser.add_argument("--num_levels", type=int, default=20, help="Number of hash encoding levels")
+    parser.add_argument("--num_levels", type=int, default=16, help="Number of hash encoding levels")
     parser.add_argument("--level_dim", type=int, default=2, help="Feature dimension per level")
     parser.add_argument("--base_resolution", type=int, default=16, help="Base grid resolution")
-    parser.add_argument("--log2_hashmap_size", type=int, default=23, help="Log2 of hash table size")
-    parser.add_argument("--desired_resolution", type=int, default=8192, help="Finest resolution")
+    parser.add_argument("--log2_hashmap_size", type=int, default=24, help="Log2 of hash table size")
+    parser.add_argument("--desired_resolution", type=int, default=512, help="Finest resolution")
 
     # Decoder config
     parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension of MLP")
     parser.add_argument("--num_layers", type=int, default=2, help="Number of MLP layers")
 
     # PSF sampling mode
-    parser.add_argument("--psf_mode", type=str, default="discrete", choices=["discrete", "gmm"],
+    parser.add_argument("--psf_mode", type=str, default="gmm", choices=["discrete", "gmm"],
                         help="PSF sampling mode: 'discrete' or 'gmm'")
-    parser.add_argument("--gmm_checkpoint", type=str, default=None,
+    parser.add_argument("--gmm_checkpoint", type=str, default="../checkpoints/levin_kernel1.pkl",
                         help="[gmm mode] Path to a pre-fitted GMMPsf .pkl file (from gmm_psf.py).")
 
     # ── Sharpness regularisation ──────────────────────────────────────────
@@ -303,7 +303,7 @@ def main():
     parser.add_argument("--l0_beta", type=float, default=10.0,
                         help="Temperature for soft-L0 sigmoid. Higher = harder threshold. "
                              "Threshold sits at grad_mag = 1/beta (default: 0.1 normalised units).")
-    parser.add_argument("--reg_warmup_fraction", type=float, default=0.3,
+    parser.add_argument("--reg_warmup_fraction", type=float, default=0,
                         help="Fraction of total steps before regularisation is switched on. "
                              "E.g. 0.3 means TV+L0 start at 30%% of training. Default 0 (always on).")
 

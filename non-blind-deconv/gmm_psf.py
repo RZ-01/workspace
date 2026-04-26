@@ -19,6 +19,7 @@ import argparse
 import os
 import pickle
 
+import cv2
 import numpy as np
 import torch
 import tifffile
@@ -106,16 +107,9 @@ class GMMPsf:
             raise ValueError("PSF has all-zero values; cannot fit GMM.")
         weights /= weight_sum
 
-        # sklearn GaussianMixture does not accept sample_weights directly in
-        # fit(), but we can use the weighted-sample trick: subsample the
-        # coordinate array with replacement using PSF probabilities, then fit
-        # the GMM to those samples (which implicitly encodes the distribution).
-        #
-        # We use n_samples proportional to the number of non-zero pixels so
-        # that the GMM has enough data to represent fine structure.
         n_nonzero = int((weights > 0).sum())
         n_samples = max(200_000, n_nonzero * 20)
-        n_samples = min(n_samples, 5_000_000)   # cap to avoid OOM
+        n_samples = min(n_samples, 500_000_000)
 
         if verbose:
             print(f"PSF shape: {psf_shape}, n_dims: {n_dims}")
@@ -124,13 +118,11 @@ class GMMPsf:
 
         rng = np.random.default_rng(random_state)
         sample_idx = rng.choice(len(coords), size=n_samples, replace=True, p=weights)
-        X = coords[sample_idx]   # (n_samples, n_dims)
+        X = coords[sample_idx].astype(np.float64)   # (n_samples, n_dims)
 
-        # --- PSF-weighted initialisation of component means ---
-        # Draw n_components positions from the PSF distribution so that every
-        # Gaussian component starts inside a bright region.  This prevents
-        # components from being wasted on dark background and greatly improves
-        # convergence compared to the default k-means random initialisation.
+        jitter = rng.uniform(low=-0.5, high=0.5, size=X.shape)
+        X += jitter
+        
         n_init_pts = min(n_components, n_nonzero)
         init_idx = rng.choice(len(coords), size=n_init_pts, replace=False, p=weights)
         means_init = coords[init_idx]   # (n_components, n_dims)
@@ -148,10 +140,11 @@ class GMMPsf:
             max_iter=max_iter,
             n_init=n_init,
             means_init=means_init,
-            init_params="random",   # weights & covariances random; means fixed above
+            init_params="random",
             random_state=random_state,
             verbose=2 if verbose else 0,
             verbose_interval=50,
+            reg_covar=1e-3,
         )
         gmm.fit(X)
 
@@ -170,7 +163,7 @@ class GMMPsf:
     def sample(self, n: int, device: torch.device = None) -> torch.Tensor:
         """
         Draw *n* offsets from the GMM using sklearn (CPU).
-        For training loops prefer :meth:`sample_gpu` to avoid CPU→GPU transfer.
+        For training loops prefer :meth:`sample_gpu` to avoid CPU->GPU transfer.
         """
         samples_np, _ = self.gmm.sample(n)
         offsets = torch.from_numpy(samples_np.astype(np.float32))
@@ -179,7 +172,7 @@ class GMMPsf:
         return offsets
 
     # ------------------------------------------------------------------
-    # GPU-native sampling (avoids CPU→GPU transfer in training loops)
+    # GPU-native sampling (avoids CPU->GPU transfer in training loops)
     # ------------------------------------------------------------------
 
     def prepare_gpu(self, device: torch.device) -> None:
@@ -226,7 +219,7 @@ class GMMPsf:
 
     def sample_gpu(self, n: int, device: torch.device) -> torch.Tensor:
         """
-        Draw *n* offsets entirely on the GPU — no CPU→GPU transfer.
+        Draw *n* offsets entirely on the GPU -- no CPU->GPU transfer.
 
         Requires :meth:`prepare_gpu` to have been called with the same device,
         or calls it automatically on the first use.
@@ -361,7 +354,7 @@ class GMMPsf:
 
         if psf is None:
             raise ValueError(
-                "checkpoint_path does not exist and psf=None — "
+                "checkpoint_path does not exist and psf=None -- "
                 "cannot fit GMM without a PSF array."
             )
 
@@ -406,11 +399,7 @@ def visualize_gmm_psf_comparison(
         If given, saves the figure to this path.
     """
     n_dims = len(psf.shape)
-
-    # Normalise original for comparison
     psf_norm = psf / psf.sum() if psf.sum() > 0 else psf
-
-    # Reconstruct GMM on original grid
     recon = gmm_psf.reconstruct(psf.shape)
 
     if n_dims == 3:
@@ -532,20 +521,15 @@ def visualize_gmm_sampling_distribution(
         Path to save the figure (.pdf or .png).
     """
     n_dims = len(psf.shape)
-    dim_labels = (["Z", "Y", "X"] if n_dims == 3 else ["Y", "X"])
-    axes_names = dim_labels
-
-    # Pixel-centre positions for each axis (centred at 0)
+    dim_labels = ["Z", "Y", "X"] if n_dims == 3 else ["Y", "X"]
     axis_coords = [np.arange(s) - (s - 1) / 2.0 for s in psf.shape]
 
-    # PSF marginal projections (sum over all other axes)
     psf_norm = psf / psf.sum()
     psf_marginals = []
     for ax in range(n_dims):
         other = tuple(i for i in range(n_dims) if i != ax)
         psf_marginals.append(psf_norm.sum(axis=other))
 
-    # GMM samples
     samples = gmm_psf.sample(n_samples).numpy()  # (N, n_dims)
 
     fig, axes_list = plt.subplots(n_dims, 1, figsize=(10, 4 * n_dims))
@@ -553,15 +537,13 @@ def visualize_gmm_sampling_distribution(
         axes_list = [axes_list]
 
     for dim_idx, (ax, label, coords, psf_marg) in enumerate(
-        zip(axes_list, axes_names, axis_coords, psf_marginals)
+        zip(axes_list, dim_labels, axis_coords, psf_marginals)
     ):
-        # PSF marginal as a step plot
         ax.plot(
             coords, psf_marg / psf_marg.max(),
             color="steelblue", linewidth=2,
             label="PSF marginal (normalised)",
         )
-        # GMM sample histogram for this axis
         lo, hi = coords[0], coords[-1]
         ax.hist(
             samples[:, dim_idx],
@@ -572,8 +554,6 @@ def visualize_gmm_sampling_distribution(
             color="tomato",
             label="GMM samples (density)",
         )
-        # Normalise hist so peak == 1 for easy visual comparison
-        # (already density=True, just rescale axis label)
         ax.set_xlabel(f"{label} offset (pixels)", fontsize=12)
         ax.set_ylabel("Relative density", fontsize=11)
         ax.set_title(f"Marginal distribution along {label}", fontsize=12)
@@ -598,50 +578,46 @@ def visualize_gmm_sampling_distribution(
 # CLI entry-point (standalone fitting)
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Fit a Gaussian Mixture Model to a discrete PSF for continuous sampling."
+def _load_psf(path: str) -> np.ndarray:
+    if path.endswith((".tif", ".tiff")):
+        return tifffile.imread(path).astype(np.float32)
+    if path.endswith(".npy"):
+        return np.load(path).astype(np.float32)
+    if path.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"cv2.imread could not open: {path}")
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+        elif img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return img.astype(np.float32)
+    raise ValueError(
+        f"Unsupported file format: {path}\n"
+        "Supported: .tif/.tiff, .npy, .png, .jpg/.jpeg, .bmp"
     )
-    parser.add_argument("--psf_path", type=str, default="/workspace/temp/workspace/psf_t0_v0.tif",
-                        help="Path to discrete PSF file (.tif, .tiff, or .npy)")
-    parser.add_argument("--output_path", type=str, default="../checkpoints/psf_gmm.pkl",
-                        help="Path to save the fitted GMM PSF (.pkl)")
-    parser.add_argument("--n_components", type=int, default=64,
-                        help="Number of Gaussian components")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--psf_path", type=str, default="/workspace/temp/W_DIP/results/levin/WDIP/im1_kernel1_img_k.png")
+    parser.add_argument("--output_path", type=str, default="../checkpoints/levin_kernel1.pkl")
+    parser.add_argument("--n_components", type=int, default=64)
     parser.add_argument("--covariance_type", type=str, default="full",
-                        choices=["full", "diag", "tied", "spherical"],
-                        help="Covariance type for GaussianMixture")
-    parser.add_argument("--max_iter", type=int, default=500,
-                        help="Maximum EM iterations")
-    parser.add_argument("--n_init", type=int, default=3,
-                        help="Number of initialisations (best kept)")
-    parser.add_argument("--num_viz_slices", type=int, default=5,
-                        help="Number of Z slices for slice-comparison figure (3D only)")
-    parser.add_argument("--viz_path", type=str, default=None,
-                        help="Path to save the slice-comparison figure. "
-                             "Extension determines format: .pdf (default) or .png. "
-                             "Defaults to <output_path stem>_comparison.pdf")
-    parser.add_argument("--sampling_viz_path", type=str, default=None,
-                        help="Path to save the marginal-histogram sampling figure. "
-                             "Defaults to <output_path stem>_sampling.pdf")
-    parser.add_argument("--n_sampling_viz", type=int, default=200_000,
-                        help="Number of GMM samples to draw for the sampling-distribution figure")
-    parser.add_argument("--no_viz", action="store_true",
-                        help="Skip all visualisation")
+                        choices=["full", "diag", "tied", "spherical"])
+    parser.add_argument("--max_iter", type=int, default=500)
+    parser.add_argument("--n_init", type=int, default=3)
+    parser.add_argument("--num_viz_slices", type=int, default=5)
+    parser.add_argument("--viz_path", type=str, default=None)
+    parser.add_argument("--sampling_viz_path", type=str, default=None)
+    parser.add_argument("--n_sampling_viz", type=int, default=200_000)
+    parser.add_argument("--no_viz", action="store_true")
     args = parser.parse_args()
 
-    # --- Load PSF ---
     print(f"Loading PSF from {args.psf_path}")
-    if args.psf_path.endswith((".tif", ".tiff")):
-        psf_np = tifffile.imread(args.psf_path).astype(np.float32)
-    elif args.psf_path.endswith(".npy"):
-        psf_np = np.load(args.psf_path).astype(np.float32)
-    else:
-        raise ValueError(f"Unsupported file format: {args.psf_path}")
-
+    psf_np = _load_psf(args.psf_path)
     print(f"PSF shape: {psf_np.shape}, range: [{psf_np.min():.4f}, {psf_np.max():.4f}]")
 
-    # --- Fit GMM ---
     gmm_psf = GMMPsf.from_discrete_psf(
         psf=psf_np,
         n_components=args.n_components,
@@ -651,35 +627,26 @@ def main():
         verbose=True,
     )
 
-    # --- Save ---
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     gmm_psf.save(args.output_path)
 
-    # --- Demo sampling ---
     print("\n--- Demo: Continuous Sampling ---")
     sample_offsets = gmm_psf.sample(10)
     print(f"Sample offsets (shape {sample_offsets.shape}):\n{sample_offsets}")
 
-    # --- Visualise ---
     if not args.no_viz:
         stem = args.output_path.replace(".pkl", "")
-
-        # Figure 1: slice-by-slice comparison (original vs GMM reconstruction)
-        viz_path = args.viz_path or f"{stem}_comparison.pdf"
         visualize_gmm_psf_comparison(
             psf=psf_np,
             gmm_psf=gmm_psf,
             num_slices=args.num_viz_slices,
-            save_path=viz_path,
+            save_path=args.viz_path or f"{stem}_comparison.pdf",
         )
-
-        # Figure 2: per-axis marginal histograms vs PSF projections
-        sampling_viz_path = args.sampling_viz_path or f"{stem}_sampling.pdf"
         visualize_gmm_sampling_distribution(
             psf=psf_np,
             gmm_psf=gmm_psf,
             n_samples=args.n_sampling_viz,
-            save_path=sampling_viz_path,
+            save_path=args.sampling_viz_path or f"{stem}_sampling.pdf",
         )
 
 
