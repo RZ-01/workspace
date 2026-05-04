@@ -1,653 +1,460 @@
 """
-Gaussian Mixture Model (GMM) based PSF representation.
+PSF 密度估计：KDE（默认）或 Normalizing Flow（zuko）
 
-Fits a discrete PSF using sklearn's GaussianMixture and provides
-continuous (sub-pixel) coordinate sampling from the fitted distribution.
+两种后端，接口完全相同：
+  - 'kde'  : Parzen 窗，每个非零像素一个 Gaussian，无需拟合，精确
+  - 'flow' : zuko NSF（神经样条流），可拟合任意连续分布，需要 pip install zuko
 
 Usage
 -----
-Standalone fitting:
-    python gmm_psf.py --psf_path /path/to/psf.tif --output_path psf.pkl
+    python gmm_psf.py --psf_path psf.png --backend kde   --output_path out.pkl
+    python gmm_psf.py --psf_path psf.png --backend flow  --output_path out.pkl
 
-As a library:
+Library:
     from gmm_psf import GMMPsf
-    gmm = GMMPsf.from_discrete_psf(psf_np, n_components=64)
-    offsets = gmm.sample(10000)   # (10000, n_dims) float32 pixel offsets
+    psf = GMMPsf.from_discrete_psf(psf_np, backend='kde')   # or 'flow'
+    offsets = psf.sample_gpu(10000, device)
 """
 
-import argparse
-import os
-import pickle
+import argparse, os, pickle
+import cv2, numpy as np, torch, tifffile, matplotlib.pyplot as plt
 
-import cv2
-import numpy as np
-import torch
-import tifffile
-import matplotlib.pyplot as plt
-from sklearn.mixture import GaussianMixture
 
+# ──────────────────────────────────────────────────────────────────────────────
+# KDE backend (Parzen window)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _KDEBackend:
+    def __init__(self, means, weights, bandwidth):
+        self.means_np    = means.astype(np.float32)
+        self.weights_np  = weights.astype(np.float32)
+        self.bandwidth   = float(bandwidth)
+        self._gpu_device = None
+
+    def fit(self, *_, **__): pass   # no-op, KDE needs no fitting
+
+    def sample_cpu(self, n):
+        rng = np.random.default_rng()
+        idx = rng.choice(len(self.weights_np), size=n, replace=True,
+                         p=self.weights_np)
+        D = self.means_np.shape[1]
+        return (self.means_np[idx]
+                + rng.normal(0, self.bandwidth, (n, D)).astype(np.float32))
+
+    def prepare_gpu(self, device):
+        self._gpu_device  = device
+        self._means_gpu   = torch.tensor(self.means_np,   device=device)
+        self._weights_gpu = torch.tensor(self.weights_np, device=device)
+
+    def sample_gpu(self, n, device):
+        if self._gpu_device != device:
+            self.prepare_gpu(device)
+        k   = torch.multinomial(self._weights_gpu, n, replacement=True)
+        eps = torch.randn(n, self.means_np.shape[1], device=device) * self.bandwidth
+        return (self._means_gpu[k] + eps).float()
+
+    def log_prob_np(self, coords):
+        """Evaluate KDE log-density at coords (N, D) → (N,) numpy."""
+        X = torch.tensor(coords, dtype=torch.float32)         # (N, D)
+        M = torch.tensor(self.means_np, dtype=torch.float32)  # (K, D)
+        W = torch.tensor(self.weights_np, dtype=torch.float32)
+        sq = ((X[:, None] - M[None]) ** 2).sum(-1)            # (N, K)
+        D  = coords.shape[1]
+        lc = (-0.5 * D * np.log(2 * np.pi * self.bandwidth**2)
+              - sq / (2 * self.bandwidth**2))                  # (N, K)
+        lp = torch.logsumexp(lc + torch.log(W + 1e-300), dim=1)
+        return lp.numpy()
+
+    def state_dict(self):
+        return {"means": self.means_np, "weights": self.weights_np,
+                "bandwidth": self.bandwidth}
+
+    @classmethod
+    def from_state_dict(cls, d):
+        return cls(d["means"], d["weights"], d["bandwidth"])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalizing Flow backend (zuko NSF)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _FlowBackend:
+    """
+    Neural Spline Flow via zuko.  Fits a bijective neural network that maps
+    a standard Gaussian to the PSF distribution.  Can represent any
+    continuous distribution given enough capacity.
+
+    Requires:  pip install zuko
+    """
+
+    def __init__(self, n_dims, n_transforms=6, hidden=128, bins=16):
+        import zuko
+        self._n_dims       = n_dims
+        self._n_transforms = n_transforms
+        self._hidden       = hidden
+        self._bins         = bins
+        self.flow = zuko.flows.NSF(
+            features        = n_dims,
+            transforms      = n_transforms,
+            hidden_features = [hidden, hidden],
+            bins            = bins,
+        )
+        self._gpu_device = None
+
+    def fit(self, coords_np, weights_np, n_epochs=2000, lr=3e-3,
+            device="cuda", verbose=True):
+        """
+        Fit flow to weighted pixel coordinates.
+        coords_np  : (K, D) nonzero pixel centres
+        weights_np : (K,)   normalised PSF values
+        """
+        self.flow = self.flow.to(device)
+        coords_t  = torch.tensor(coords_np,  dtype=torch.float32, device=device)
+        weights_t = torch.tensor(weights_np, dtype=torch.float32, device=device)
+
+        opt = torch.optim.Adam(self.flow.parameters(), lr=lr)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_epochs)
+
+        best_loss, patience, patience_limit = float("inf"), 0, 200
+        for epoch in range(n_epochs):
+            opt.zero_grad()
+            # Weighted NLL: -E_w[log p(x)]
+            log_p = self.flow().log_prob(coords_t)          # (K,)
+            loss  = -(log_p * weights_t).sum()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.flow.parameters(), 1.0)
+            opt.step(); sched.step()
+
+            l = loss.item()
+            if verbose and epoch % 200 == 0:
+                print(f"  [flow] epoch {epoch:4d}  loss={l:.4f}")
+            if l < best_loss - 1e-4:
+                best_loss = l; patience = 0
+            else:
+                patience += 1
+            if patience >= patience_limit:
+                if verbose:
+                    print(f"  [flow] early stop at epoch {epoch}")
+                break
+
+    def sample_cpu(self, n):
+        with torch.no_grad():
+            s = self.flow().sample((n,))
+        return s.cpu().numpy().astype(np.float32)
+
+    def prepare_gpu(self, device):
+        self._gpu_device = device
+        self.flow = self.flow.to(device)
+
+    def sample_gpu(self, n, device):
+        if self._gpu_device != device:
+            self.prepare_gpu(device)
+        with torch.no_grad():
+            return self.flow().sample((n,)).float()
+
+    def log_prob_np(self, coords):
+        device = next(self.flow.parameters()).device
+        x = torch.tensor(coords, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            lp = self.flow().log_prob(x)
+        return lp.cpu().numpy()
+
+    def state_dict(self):
+        return {"flow_state": self.flow.state_dict(),
+                "flow_config": {
+                    "n_dims":       self._n_dims,
+                    "n_transforms": self._n_transforms,
+                    "hidden":       self._hidden,
+                    "bins":         self._bins,
+                }}
+
+    @classmethod
+    def from_state_dict(cls, d):
+        cfg = d["flow_config"]
+        obj = cls(cfg["n_dims"], cfg["n_transforms"],
+                  cfg.get("hidden", 128), cfg.get("bins", 16))
+        obj.flow.load_state_dict(d["flow_state"])
+        return obj
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public class
+# ──────────────────────────────────────────────────────────────────────────────
 
 class GMMPsf:
-    """
-    Gaussian Mixture Model representation of a PSF.
 
-    The GMM is fitted to the PSF treated as a probability distribution
-    over pixel coordinates (PSF values are used as sample weights).
-
-    Sampling returns continuous (sub-pixel) offsets in pixel units,
-    centred at the PSF origin (centre of the array).
-
-    Parameters
-    ----------
-    gmm : sklearn.mixture.GaussianMixture
-        A fitted GaussianMixture object.
-    psf_shape : tuple
-        Original PSF shape, e.g. (D, H, W) or (H, W).
-    """
-
-    def __init__(self, gmm: GaussianMixture, psf_shape: tuple):
-        self.gmm = gmm
-        self.psf_shape = psf_shape
-        self.n_dims = len(psf_shape)
-        self.n_components = gmm.n_components
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    def __init__(self, backend, psf_shape):
+        self._backend     = backend
+        self.psf_shape    = psf_shape
+        self.n_dims       = len(psf_shape)
+        # expose for viz titles
+        self.n_components = getattr(backend, "means_np",
+                                    np.zeros((1,1))).shape[0]
+        self.bandwidth    = getattr(backend, "bandwidth", None)
 
     @classmethod
     def from_discrete_psf(
         cls,
         psf: np.ndarray,
-        n_components: int = 64,
-        covariance_type: str = "full",
-        max_iter: int = 500,
-        n_init: int = 3,
-        random_state: int = 42,
+        backend: str = "kde",
+        bandwidth: float = 0.4,
+        # flow params
+        n_transforms: int = 6,
+        flow_hidden:  int = 128,
+        flow_bins:    int = 16,
+        flow_epochs:  int = 2000,
+        flow_lr:      float = 3e-3,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
         verbose: bool = True,
     ) -> "GMMPsf":
-        """
-        Fit a GMM to a discrete PSF array.
-
-        The PSF values are normalised to a probability distribution and used
-        as sample weights for fitting.
-
-        Parameters
-        ----------
-        psf : np.ndarray
-            Discrete PSF array, shape (H, W) or (D, H, W).  Values must be
-            non-negative.
-        n_components : int
-            Number of Gaussian components.
-        covariance_type : str
-            Covariance type for GaussianMixture ('full', 'diag', 'tied', 'spherical').
-        max_iter : int
-            Maximum EM iterations.
-        n_init : int
-            Number of initialisations; the best is kept.
-        random_state : int
-            Random seed.
-        verbose : bool
-            Print progress information.
-        """
-        psf = psf.astype(np.float64)
+        psf = psf.astype(np.float32)
         psf_shape = psf.shape
         n_dims = len(psf_shape)
 
-        # --- Build pixel-coordinate array (centred at 0) ---
-        axes = [np.arange(s) - (s - 1) / 2.0 for s in psf_shape]
-        grids = np.meshgrid(*axes, indexing="ij")           # each: psf_shape
-        coords = np.stack([g.ravel() for g in grids], axis=1)  # (N, n_dims)
+        axes   = [np.arange(s) - (s-1)/2.0 for s in psf_shape]
+        grids  = np.meshgrid(*axes, indexing="ij")
+        coords = np.stack([g.ravel() for g in grids], axis=1).astype(np.float32)
 
-        # --- Normalise PSF to a probability distribution ---
-        weights = psf.ravel().astype(np.float64)
-        weights = np.clip(weights, 0.0, None)
-        weight_sum = weights.sum()
-        if weight_sum == 0:
-            raise ValueError("PSF has all-zero values; cannot fit GMM.")
-        weights /= weight_sum
-
-        n_nonzero = int((weights > 0).sum())
-        n_samples = max(200_000, n_nonzero * 20)
-        n_samples = min(n_samples, 500_000_000)
+        w = psf.ravel().clip(0.0)
+        w /= w.sum()
+        mask = w > 0
+        nz_coords, nz_weights = coords[mask], w[mask]
+        nz_weights /= nz_weights.sum()
 
         if verbose:
-            print(f"PSF shape: {psf_shape}, n_dims: {n_dims}")
-            print(f"Non-zero pixels: {n_nonzero:,} / {len(weights):,}")
-            print(f"Drawing {n_samples:,} weighted samples for GMM fitting ...")
+            print(f"PSF shape={psf_shape}, nonzero pixels={mask.sum()}, backend={backend}")
 
-        rng = np.random.default_rng(random_state)
-        sample_idx = rng.choice(len(coords), size=n_samples, replace=True, p=weights)
-        X = coords[sample_idx].astype(np.float64)   # (n_samples, n_dims)
+        if backend == "kde":
+            b = _KDEBackend(nz_coords, nz_weights, bandwidth)
 
-        jitter = rng.uniform(low=-0.5, high=0.5, size=X.shape)
-        X += jitter
-        
-        n_init_pts = min(n_components, n_nonzero)
-        init_idx = rng.choice(len(coords), size=n_init_pts, replace=False, p=weights)
-        means_init = coords[init_idx]   # (n_components, n_dims)
-
-        if verbose:
-            print(
-                f"Fitting GMM: n_components={n_components}, "
-                f"covariance_type={covariance_type}, n_init={n_init}\n"
-                f"  PSF-weighted means_init: all {n_init_pts} components seeded in bright regions."
-            )
-
-        gmm = GaussianMixture(
-            n_components=n_components,
-            covariance_type=covariance_type,
-            max_iter=max_iter,
-            n_init=n_init,
-            means_init=means_init,
-            init_params="random",
-            random_state=random_state,
-            verbose=2 if verbose else 0,
-            verbose_interval=50,
-            reg_covar=1e-3,
-        )
-        gmm.fit(X)
-
-        if verbose:
-            ll = gmm.score(X)
-            print(f"GMM fitting done.  Log-likelihood per sample: {ll:.4f}")
-            print(f"  Converged: {gmm.converged_}")
-            print(f"  n_iter: {gmm.n_iter_}")
-
-        return cls(gmm=gmm, psf_shape=psf_shape)
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
-
-    def sample(self, n: int, device: torch.device = None) -> torch.Tensor:
-        """
-        Draw *n* offsets from the GMM using sklearn (CPU).
-        For training loops prefer :meth:`sample_gpu` to avoid CPU->GPU transfer.
-        """
-        samples_np, _ = self.gmm.sample(n)
-        offsets = torch.from_numpy(samples_np.astype(np.float32))
-        if device is not None:
-            offsets = offsets.to(device)
-        return offsets
-
-    # ------------------------------------------------------------------
-    # GPU-native sampling (avoids CPU->GPU transfer in training loops)
-    # ------------------------------------------------------------------
-
-    def prepare_gpu(self, device: torch.device) -> None:
-        """
-        Precompute and cache GMM parameters as GPU tensors.
-
-        Call once before the training loop.  Subsequent calls to
-        :meth:`sample_gpu` will reuse the cached tensors.
-        """
-        self._gpu_device = device
-        self._weights_gpu = torch.tensor(
-            self.gmm.weights_, dtype=torch.float32, device=device
-        )  # (K,)
-        self._means_gpu = torch.tensor(
-            self.gmm.means_, dtype=torch.float32, device=device
-        )  # (K, D)
-
-        cov_type = self.gmm.covariance_type
-        self._cov_type_gpu = cov_type
-
-        if cov_type == "full":
-            covs = torch.tensor(
-                self.gmm.covariances_, dtype=torch.float32, device=device
-            )  # (K, D, D)
-            self._L_gpu = torch.linalg.cholesky(covs)  # (K, D, D)
-        elif cov_type == "diag":
-            self._stds_gpu = torch.tensor(
-                np.sqrt(self.gmm.covariances_), dtype=torch.float32, device=device
-            )  # (K, D)
-        elif cov_type == "tied":
-            cov = torch.tensor(
-                self.gmm.covariances_, dtype=torch.float32, device=device
-            )  # (D, D)
-            self._L_gpu = torch.linalg.cholesky(cov)  # (D, D)
-        elif cov_type == "spherical":
-            self._stds_gpu = torch.tensor(
-                np.sqrt(self.gmm.covariances_), dtype=torch.float32, device=device
-            )  # (K,)
-
-        print(
-            f"GMMPsf GPU tensors cached on {device}  "
-            f"(K={self.n_components}, cov={cov_type})"
-        )
-
-    def sample_gpu(self, n: int, device: torch.device) -> torch.Tensor:
-        """
-        Draw *n* offsets entirely on the GPU -- no CPU->GPU transfer.
-
-        Requires :meth:`prepare_gpu` to have been called with the same device,
-        or calls it automatically on the first use.
-
-        Returns
-        -------
-        offsets : torch.Tensor, shape (n, n_dims), float32, on *device*
-        """
-        if not hasattr(self, "_gpu_device") or self._gpu_device != device:
-            self.prepare_gpu(device)
-
-        # 1. Sample component indices proportional to mixture weights
-        k_idx = torch.multinomial(self._weights_gpu, n, replacement=True)  # (n,)
-        selected_means = self._means_gpu[k_idx]  # (n, D)
-
-        # 2. Sample from the selected Gaussian components
-        if self._cov_type_gpu == "full":
-            selected_L = self._L_gpu[k_idx]          # (n, D, D)
-            eps = torch.randn(n, self.n_dims, 1, device=device)
-            samples = selected_means + (selected_L @ eps).squeeze(-1)
-        elif self._cov_type_gpu == "diag":
-            selected_stds = self._stds_gpu[k_idx]    # (n, D)
-            eps = torch.randn(n, self.n_dims, device=device)
-            samples = selected_means + selected_stds * eps
-        elif self._cov_type_gpu == "tied":
-            eps = torch.randn(n, self.n_dims, 1, device=device)
-            samples = selected_means + (self._L_gpu @ eps).squeeze(-1)
-        elif self._cov_type_gpu == "spherical":
-            selected_stds = self._stds_gpu[k_idx].unsqueeze(-1)  # (n, 1)
-            eps = torch.randn(n, self.n_dims, device=device)
-            samples = selected_means + selected_stds * eps
+        elif backend == "flow":
+            b = _FlowBackend(n_dims, n_transforms, flow_hidden, flow_bins)
+            if verbose:
+                print(f"Fitting normalizing flow ({n_transforms} transforms, "
+                      f"hidden={flow_hidden}, bins={flow_bins}) ...")
+            b.fit(nz_coords, nz_weights,
+                  n_epochs=flow_epochs, lr=flow_lr,
+                  device=device, verbose=verbose)
         else:
-            raise ValueError(f"Unknown covariance type: {self._cov_type_gpu}")
+            raise ValueError(f"Unknown backend '{backend}'. Choose 'kde' or 'flow'.")
 
-        return samples.float()  # (n, D)
+        return cls(b, psf_shape)
+
+    # ── sampling ──────────────────────────────────────────────────────
+
+    def sample(self, n, device=None):
+        t = torch.from_numpy(self._backend.sample_cpu(n))
+        return t if device is None else t.to(device)
+
+    def prepare_gpu(self, device):
+        self._backend.prepare_gpu(device)
+
+    def sample_gpu(self, n, device):
+        return self._backend.sample_gpu(n, device)
+
+    # ── density ───────────────────────────────────────────────────────
 
     def log_prob(self, coords: np.ndarray) -> np.ndarray:
-        """
-        Evaluate GMM log-probability density at given coordinates.
+        return self._backend.log_prob_np(coords)
 
-        Parameters
-        ----------
-        coords : np.ndarray, shape (N, n_dims)
-            Pixel-unit coordinates centred at the PSF origin.
-
-        Returns
-        -------
-        log_prob : np.ndarray, shape (N,)
-        """
-        return self.gmm.score_samples(coords)
-
-    # ------------------------------------------------------------------
-    # Reconstruction helper (for visualisation / evaluation)
-    # ------------------------------------------------------------------
-
-    def reconstruct(self, shape: tuple = None) -> np.ndarray:
-        """
-        Reconstruct a PSF image from the GMM by evaluating the density
-        on a regular grid matching the original PSF shape (or a custom shape).
-
-        Parameters
-        ----------
-        shape : tuple, optional
-            Grid shape to reconstruct on.  Defaults to `self.psf_shape`.
-
-        Returns
-        -------
-        psf_recon : np.ndarray
-            Reconstructed PSF, normalised to sum to 1.
-        """
-        if shape is None:
-            shape = self.psf_shape
-
-        axes = [np.arange(s) - (s - 1) / 2.0 for s in shape]
+    def reconstruct(self, shape=None):
+        if shape is None: shape = self.psf_shape
+        axes  = [np.arange(s)-(s-1)/2.0 for s in shape]
         grids = np.meshgrid(*axes, indexing="ij")
-        coords = np.stack([g.ravel() for g in grids], axis=1)   # (N, n_dims)
+        coords = np.stack([g.ravel() for g in grids], axis=1).astype(np.float32)
+        lp = self.log_prob(coords)
+        p  = np.exp(lp - lp.max()).reshape(shape)
+        return (p / p.sum()).astype(np.float32)
 
-        log_p = self.log_prob(coords)
-        p = np.exp(log_p - log_p.max())     # relative probability
-        p = p.reshape(shape)
-        p /= p.sum()
-        return p.astype(np.float32)
+    # ── persistence ───────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
-    def save(self, path: str) -> None:
-        """Save the GMM PSF to a pickle file."""
+    def save(self, path):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        btype = "kde" if isinstance(self._backend, _KDEBackend) else "flow"
         with open(path, "wb") as f:
-            pickle.dump({"gmm": self.gmm, "psf_shape": self.psf_shape}, f)
-        print(f"GMM PSF saved to {path}")
+            pickle.dump({"backend_type": btype,
+                         "backend_state": self._backend.state_dict(),
+                         "psf_shape": self.psf_shape}, f)
+        print(f"PSF saved ({btype}) → {path}")
 
     @classmethod
-    def load(cls, path: str) -> "GMMPsf":
-        """Load a GMM PSF from a pickle file."""
+    def load(cls, path):
         with open(path, "rb") as f:
-            data = pickle.load(f)
-        obj = cls(gmm=data["gmm"], psf_shape=data["psf_shape"])
-        print(f"GMM PSF loaded from {path}  (n_components={obj.n_components}, shape={obj.psf_shape})")
-        return obj
+            d = pickle.load(f)
+        btype = d.get("backend_type", "kde")
+        B = _KDEBackend if btype == "kde" else _FlowBackend
+        b = B.from_state_dict(d["backend_state"])
+        return cls(b, d["psf_shape"])
 
     @classmethod
-    def load_or_fit(
-        cls,
-        checkpoint_path: str,
-        psf: np.ndarray = None,
-        n_components: int = 64,
-        covariance_type: str = "full",
-        max_iter: int = 500,
-        n_init: int = 3,
-        random_state: int = 42,
-        verbose: bool = True,
-    ) -> "GMMPsf":
-        """
-        Load a pre-fitted GMM from *checkpoint_path* if it exists,
-        otherwise fit a new GMM from *psf* and save it to *checkpoint_path*.
-
-        Parameters
-        ----------
-        checkpoint_path : str
-            Path to a .pkl file.  Loaded if it exists; written after fitting
-            if it does not.
-        psf : np.ndarray, optional
-            Discrete PSF array.  Required when the checkpoint does not exist.
-        All other kwargs are forwarded to :meth:`from_discrete_psf`.
-        """
-        if checkpoint_path is not None and os.path.isfile(checkpoint_path):
-            print(f"Loading pre-fitted GMM PSF from {checkpoint_path}")
+    def load_or_fit(cls, checkpoint_path, psf=None, **kw):
+        if checkpoint_path and os.path.isfile(checkpoint_path):
             return cls.load(checkpoint_path)
-
         if psf is None:
-            raise ValueError(
-                "checkpoint_path does not exist and psf=None -- "
-                "cannot fit GMM without a PSF array."
-            )
-
-        print("Fitting GMM PSF from discrete PSF ...")
-        obj = cls.from_discrete_psf(
-            psf=psf,
-            n_components=n_components,
-            covariance_type=covariance_type,
-            max_iter=max_iter,
-            n_init=n_init,
-            random_state=random_state,
-            verbose=verbose,
-        )
-        if checkpoint_path is not None:
+            raise ValueError("No checkpoint and psf=None")
+        obj = cls.from_discrete_psf(psf, **kw)
+        if checkpoint_path:
             obj.save(checkpoint_path)
         return obj
 
 
-# ---------------------------------------------------------------------------
-# Visualisation
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualisation — FIXED: compare at discrete pixel positions, not histogram
+# ──────────────────────────────────────────────────────────────────────────────
 
-def visualize_gmm_psf_comparison(
-    psf: np.ndarray,
-    gmm_psf: GMMPsf,
-    num_slices: int = 5,
-    save_path: str = None,
-) -> None:
-    """
-    Visualise original PSF vs GMM reconstruction at multiple Z slices (3D)
-    or as a single panel (2D).
-
-    Parameters
-    ----------
-    psf : np.ndarray
-        Original discrete PSF, shape (D, H, W) or (H, W).
-    gmm_psf : GMMPsf
-        Fitted GMM PSF.
-    num_slices : int
-        Number of Z slices to show (3D only).
-    save_path : str, optional
-        If given, saves the figure to this path.
-    """
-    n_dims = len(psf.shape)
-    psf_norm = psf / psf.sum() if psf.sum() > 0 else psf
-    recon = gmm_psf.reconstruct(psf.shape)
+def visualize_gmm_psf_comparison(psf, gmm_psf, num_slices=5, save_path=None):
+    n_dims   = len(psf.shape)
+    psf_norm = psf / psf.sum()
+    recon    = gmm_psf.reconstruct(psf.shape)
 
     if n_dims == 3:
         D, H, W = psf.shape
-        slice_indices = np.linspace(0, D - 1, num_slices, dtype=int)
-        fig, axes = plt.subplots(num_slices, 4, figsize=(16, 4 * num_slices))
-
-        for i, z_idx in enumerate(slice_indices):
-            orig_slice = psf_norm[z_idx]
-            recon_slice = recon[z_idx]
-            error = np.abs(orig_slice - recon_slice)
-
-            im0 = axes[i, 0].imshow(orig_slice, cmap="hot", interpolation="nearest")
-            axes[i, 0].set_title(f"Original PSF (Z={z_idx})")
-            axes[i, 0].axis("off")
-            plt.colorbar(im0, ax=axes[i, 0], fraction=0.046)
-
-            im1 = axes[i, 1].imshow(recon_slice, cmap="hot", interpolation="nearest")
-            axes[i, 1].set_title(f"GMM Recon (Z={z_idx})")
-            axes[i, 1].axis("off")
-            plt.colorbar(im1, ax=axes[i, 1], fraction=0.046)
-
-            im2 = axes[i, 2].imshow(error, cmap="viridis", interpolation="nearest")
-            axes[i, 2].set_title(f"Abs Error (Z={z_idx})")
-            axes[i, 2].axis("off")
-            plt.colorbar(im2, ax=axes[i, 2], fraction=0.046)
-
-            center_y = H // 2
-            axes[i, 3].plot(orig_slice[center_y, :], "b-", label="Original", linewidth=2)
-            axes[i, 3].plot(recon_slice[center_y, :], "r--", label="GMM Recon", linewidth=2)
-            mse = np.mean((orig_slice - recon_slice) ** 2)
-            psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float("inf")
-            axes[i, 3].set_title(f"Center Line (Z={z_idx})")
-            axes[i, 3].set_xlabel("X")
-            axes[i, 3].set_ylabel("Intensity")
-            axes[i, 3].legend()
-            axes[i, 3].grid(True, alpha=0.3)
-            axes[i, 3].text(
-                0.02, 0.98,
-                f"MSE: {mse:.2e}\nPSNR: {psnr:.1f} dB",
-                transform=axes[i, 3].transAxes,
-                verticalalignment="top",
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-            )
-
-    elif n_dims == 2:
-        H, W = psf.shape
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-        error = np.abs(psf_norm - recon)
-
-        im0 = axes[0].imshow(psf_norm, cmap="hot", interpolation="nearest")
-        axes[0].set_title("Original PSF")
-        axes[0].axis("off")
-        plt.colorbar(im0, ax=axes[0], fraction=0.046)
-
-        im1 = axes[1].imshow(recon, cmap="hot", interpolation="nearest")
-        axes[1].set_title("GMM Recon")
-        axes[1].axis("off")
-        plt.colorbar(im1, ax=axes[1], fraction=0.046)
-
-        im2 = axes[2].imshow(error, cmap="viridis", interpolation="nearest")
-        axes[2].set_title("Abs Error")
-        axes[2].axis("off")
-        plt.colorbar(im2, ax=axes[2], fraction=0.046)
-
-        center_y = H // 2
-        axes[3].plot(psf_norm[center_y, :], "b-", label="Original", linewidth=2)
-        axes[3].plot(recon[center_y, :], "r--", label="GMM Recon", linewidth=2)
-        mse = np.mean((psf_norm - recon) ** 2)
-        psnr = 10 * np.log10(1.0 / mse) if mse > 0 else float("inf")
-        axes[3].set_title("Center Line Profile")
-        axes[3].set_xlabel("X")
-        axes[3].set_ylabel("Intensity")
-        axes[3].legend()
-        axes[3].grid(True, alpha=0.3)
-        axes[3].text(
-            0.02, 0.98,
-            f"MSE: {mse:.2e}\nPSNR: {psnr:.1f} dB",
-            transform=axes[3].transAxes,
-            verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-        )
-
+        sidx = np.linspace(0, D-1, num_slices, dtype=int)
+        fig, axes = plt.subplots(num_slices, 4, figsize=(16, 4*num_slices))
+        for i, z in enumerate(sidx):
+            o, r, e = psf_norm[z], recon[z], np.abs(psf_norm[z]-recon[z])
+            for col, dat, title, cmap in zip(
+                    range(3), [o,r,e],
+                    [f"Original (Z={z})", f"Recon (Z={z})", f"Error (Z={z})"],
+                    ["hot","hot","viridis"]):
+                im = axes[i,col].imshow(dat, cmap=cmap, interpolation="nearest")
+                axes[i,col].set_title(title); axes[i,col].axis("off")
+                plt.colorbar(im, ax=axes[i,col], fraction=0.046)
+            cy = H//2
+            axes[i,3].plot(o[cy], "b-", label="Original", lw=2)
+            axes[i,3].plot(r[cy], "r--",label="Recon",    lw=2)
+            mse = np.mean((o-r)**2)
+            axes[i,3].set_title(f"Line Z={z}"); axes[i,3].legend(); axes[i,3].grid(alpha=0.3)
+            axes[i,3].text(0.02,0.98,f"MSE:{mse:.2e}",transform=axes[i,3].transAxes,va="top",
+                           bbox=dict(boxstyle="round",facecolor="wheat",alpha=0.5))
     else:
-        raise ValueError(f"Unsupported PSF dimensionality: {n_dims}")
+        H, W = psf.shape
+        fig, axes = plt.subplots(1,4,figsize=(16,4))
+        o, r, e = psf_norm, recon, np.abs(psf_norm-recon)
+        for col, dat, title, cmap in zip(range(3),[o,r,e],
+                ["Original","Recon","Error"],["hot","hot","viridis"]):
+            im = axes[col].imshow(dat,cmap=cmap,interpolation="nearest")
+            axes[col].set_title(title); axes[col].axis("off")
+            plt.colorbar(im,ax=axes[col],fraction=0.046)
+        cy = H//2
+        axes[3].plot(o[cy],"b-",label="Original",lw=2)
+        axes[3].plot(r[cy],"r--",label="Recon",lw=2)
+        mse = np.mean((o-r)**2)
+        axes[3].legend(); axes[3].grid(alpha=0.3)
+        axes[3].text(0.02,0.98,f"MSE:{mse:.2e}",transform=axes[3].transAxes,va="top",
+                     bbox=dict(boxstyle="round",facecolor="wheat",alpha=0.5))
 
-    plt.suptitle(f"GMM PSF Comparison  (K={gmm_psf.n_components} components)", fontsize=14)
+    plt.suptitle(f"PSF Reconstruction", fontsize=14)
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Slice comparison saved to {save_path}")
-
+    if save_path: plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def visualize_gmm_sampling_distribution(
-    psf: np.ndarray,
-    gmm_psf: "GMMPsf",
-    n_samples: int = 200_000,
-    save_path: str = None,
-) -> None:
-    """
-    Visualise the GMM sampling distribution by comparing per-axis marginal
-    histograms of GMM samples against the PSF's marginal projections.
-
-    For a 3D PSF this produces a 3-row figure (Z, Y, X axes).
-    For a 2D PSF this produces a 2-row figure (Y, X axes).
-
-    Parameters
-    ----------
-    psf : np.ndarray
-        Original discrete PSF, shape (D, H, W) or (H, W).
-    gmm_psf : GMMPsf
-        Fitted GMM PSF.
-    n_samples : int
-        Number of GMM samples to draw for the histograms.
-    save_path : str, optional
-        Path to save the figure (.pdf or .png).
-    """
-    n_dims = len(psf.shape)
-    dim_labels = ["Z", "Y", "X"] if n_dims == 3 else ["Y", "X"]
-    axis_coords = [np.arange(s) - (s - 1) / 2.0 for s in psf.shape]
+def visualize_gmm_sampling_distribution(psf, gmm_psf, n_samples=200_000, save_path=None):
+    n_dims      = len(psf.shape)
+    dim_labels  = ["Z","Y","X"] if n_dims == 3 else ["Y","X"]
+    axis_coords = [np.arange(s)-(s-1)/2.0 for s in psf.shape]
 
     psf_norm = psf / psf.sum()
+
+    # PSF marginals at discrete pixel positions
     psf_marginals = []
     for ax in range(n_dims):
         other = tuple(i for i in range(n_dims) if i != ax)
         psf_marginals.append(psf_norm.sum(axis=other))
 
-    samples = gmm_psf.sample(n_samples).numpy()  # (N, n_dims)
+    # ── KEY FIX: evaluate MODEL density at the same discrete positions ──
+    # Build 1-D grids for each dimension, evaluate the full n-D density,
+    # then marginalise analytically via reconstruct() and sum.
+    recon = gmm_psf.reconstruct(psf.shape)
+    model_marginals = []
+    for ax in range(n_dims):
+        other = tuple(i for i in range(n_dims) if i != ax)
+        model_marginals.append(recon.sum(axis=other))
 
-    fig, axes_list = plt.subplots(n_dims, 1, figsize=(10, 4 * n_dims))
-    if n_dims == 1:
-        axes_list = [axes_list]
+    # Also draw raw samples for the histogram (visual sanity check)
+    samples = gmm_psf.sample(n_samples).numpy()
 
-    for dim_idx, (ax, label, coords, psf_marg) in enumerate(
-        zip(axes_list, dim_labels, axis_coords, psf_marginals)
-    ):
-        ax.plot(
-            coords, psf_marg / psf_marg.max(),
-            color="steelblue", linewidth=2,
-            label="PSF marginal (normalised)",
-        )
-        lo, hi = coords[0], coords[-1]
-        ax.hist(
-            samples[:, dim_idx],
-            bins=len(coords),
-            range=(lo - 0.5, hi + 0.5),
-            density=True,
-            alpha=0.55,
-            color="tomato",
-            label="GMM samples (density)",
-        )
+    fig, axes_list = plt.subplots(n_dims, 1, figsize=(10, 4*n_dims))
+    if n_dims == 1: axes_list = [axes_list]
+
+    for dim_idx, (ax, label, coords, psf_m, mod_m) in enumerate(
+            zip(axes_list, dim_labels, axis_coords, psf_marginals, model_marginals)):
+
+        lo, hi = coords[0]-0.5, coords[-1]+0.5
+        bins   = len(coords) * 4   # finer bins for the raw-samples histogram
+
+        # Raw samples histogram (background reference)
+        ax.hist(samples[:, dim_idx], bins=bins, range=(lo, hi),
+                density=True, alpha=0.35, color="tomato", label="Raw samples")
+
+        # Model marginal (evaluated analytically) — should match PSF exactly for KDE
+        ax.plot(coords, mod_m / mod_m.sum() / (coords[1]-coords[0] if len(coords)>1 else 1),
+                "r-", lw=2, label="Model marginal (analytic)")
+
+        # Ground-truth PSF marginal
+        ax.plot(coords, psf_m / psf_m.sum() / (coords[1]-coords[0] if len(coords)>1 else 1),
+                "b--", lw=2, label="PSF marginal (ground truth)")
+
         ax.set_xlabel(f"{label} offset (pixels)", fontsize=12)
-        ax.set_ylabel("Relative density", fontsize=11)
-        ax.set_title(f"Marginal distribution along {label}", fontsize=12)
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("Density", fontsize=11)
+        ax.set_title(f"Marginal along {label}", fontsize=12)
+        ax.legend(fontsize=10); ax.grid(alpha=0.3)
 
-    fig.suptitle(
-        f"GMM Sampling Distribution vs PSF Marginals\n"
-        f"K={gmm_psf.n_components} components, {n_samples:,} samples",
-        fontsize=13,
-    )
+    bname = "KDE" if isinstance(gmm_psf._backend, _KDEBackend) else "Flow"
+    fig.suptitle(f"{bname} PSF — Marginal Comparison\n{n_samples:,} samples", fontsize=13)
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, bbox_inches="tight")
-        print(f"Sampling distribution saved to {save_path}")
-
+    if save_path: plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
-# ---------------------------------------------------------------------------
-# CLI entry-point (standalone fitting)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _load_psf(path: str) -> np.ndarray:
-    if path.endswith((".tif", ".tiff")):
-        return tifffile.imread(path).astype(np.float32)
-    if path.endswith(".npy"):
-        return np.load(path).astype(np.float32)
-    if path.endswith((".png", ".jpg", ".jpeg", ".bmp")):
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(f"cv2.imread could not open: {path}")
-        if img.ndim == 3 and img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-        elif img.ndim == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        return img.astype(np.float32)
-    raise ValueError(
-        f"Unsupported file format: {path}\n"
-        "Supported: .tif/.tiff, .npy, .png, .jpg/.jpeg, .bmp"
-    )
+def _load_psf(path):
+    if path.endswith((".tif",".tiff")): return tifffile.imread(path).astype(np.float32)
+    if path.endswith(".npy"):           return np.load(path).astype(np.float32)
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None: raise FileNotFoundError(path)
+    if img.ndim==3 and img.shape[2]==4: img=cv2.cvtColor(img,cv2.COLOR_BGRA2GRAY)
+    elif img.ndim==3:                   img=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+    return img.astype(np.float32)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--psf_path", type=str, default="/workspace/temp/W_DIP/results/levin/WDIP/im1_kernel1_img_k.png")
-    parser.add_argument("--output_path", type=str, default="../checkpoints/levin_kernel1.pkl")
-    parser.add_argument("--n_components", type=int, default=64)
-    parser.add_argument("--covariance_type", type=str, default="full",
-                        choices=["full", "diag", "tied", "spherical"])
-    parser.add_argument("--max_iter", type=int, default=500)
-    parser.add_argument("--n_init", type=int, default=3)
-    parser.add_argument("--num_viz_slices", type=int, default=5)
-    parser.add_argument("--viz_path", type=str, default=None)
-    parser.add_argument("--sampling_viz_path", type=str, default=None)
-    parser.add_argument("--n_sampling_viz", type=int, default=200_000)
-    parser.add_argument("--no_viz", action="store_true")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--psf_path",    default="/workspace/temp/W_DIP/results/levin/WDIP/im1_kernel2_img_k.png")
+    p.add_argument("--output_path", default="../checkpoints/levin_kernel2.pkl")
+    p.add_argument("--backend",     default="kde", choices=["kde","flow"])
+    p.add_argument("--bandwidth",   type=float, default=0.4)
+    p.add_argument("--flow_epochs", type=int,   default=2000)
+    p.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--no_viz",      action="store_true")
+    p.add_argument("--num_viz_slices", type=int, default=5)
+    p.add_argument("--viz_path",          default=None)
+    p.add_argument("--sampling_viz_path", default=None)
+    p.add_argument("--n_sampling_viz",    type=int, default=200_000)
+    args = p.parse_args()
 
-    print(f"Loading PSF from {args.psf_path}")
-    psf_np = _load_psf(args.psf_path)
-    print(f"PSF shape: {psf_np.shape}, range: [{psf_np.min():.4f}, {psf_np.max():.4f}]")
-
+    psf_np  = _load_psf(args.psf_path)
     gmm_psf = GMMPsf.from_discrete_psf(
-        psf=psf_np,
-        n_components=args.n_components,
-        covariance_type=args.covariance_type,
-        max_iter=args.max_iter,
-        n_init=args.n_init,
-        verbose=True,
-    )
+        psf_np, backend=args.backend, bandwidth=args.bandwidth,
+        flow_epochs=args.flow_epochs, device=args.device, verbose=True)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     gmm_psf.save(args.output_path)
 
-    print("\n--- Demo: Continuous Sampling ---")
-    sample_offsets = gmm_psf.sample(10)
-    print(f"Sample offsets (shape {sample_offsets.shape}):\n{sample_offsets}")
+    device = torch.device(args.device)
+    print("CPU sample:", gmm_psf.sample(3))
+    print("GPU sample:", gmm_psf.sample_gpu(3, device))
 
     if not args.no_viz:
-        stem = args.output_path.replace(".pkl", "")
-        visualize_gmm_psf_comparison(
-            psf=psf_np,
-            gmm_psf=gmm_psf,
-            num_slices=args.num_viz_slices,
-            save_path=args.viz_path or f"{stem}_comparison.pdf",
-        )
-        visualize_gmm_sampling_distribution(
-            psf=psf_np,
-            gmm_psf=gmm_psf,
-            n_samples=args.n_sampling_viz,
-            save_path=args.sampling_viz_path or f"{stem}_sampling.pdf",
-        )
+        stem = args.output_path.replace(".pkl","")
+        visualize_gmm_psf_comparison(psf_np, gmm_psf, args.num_viz_slices,
+                                     args.viz_path or f"{stem}_comparison.pdf")
+        visualize_gmm_sampling_distribution(psf_np, gmm_psf, args.n_sampling_viz,
+                                            args.sampling_viz_path or f"{stem}_sampling.pdf")
 
 
 if __name__ == "__main__":

@@ -101,30 +101,9 @@ def compute_gradient_losses(
     coords: torch.Tensor,
     grad_sample_size: int,
     fd_eps: float,
-    l0_beta: float,
+    welsch_sigma: float,          # was: l0_beta
     stochastic_alpha: float = 0.0,
 ) -> tuple:
-    """
-    Estimate INR spatial gradients via finite difference and compute:
-      - tv_loss  : L1-TV  (isotropic, penalises all gradients → suppresses noise)
-      - l0_loss  : soft-L0 (penalises small *non-zero* gradients → polarises edges)
-
-    Inputs
-    ------
-    coords : (N, 2), float32, on GPU, normalised [0,1] in (y, x) order.
-             Reuses target_coords already resident on GPU — zero extra CPU→GPU cost.
-    grad_sample_size : number of points to subsample from coords.
-    fd_eps  : finite-difference step in normalised coordinate units (~1e-3).
-    l0_beta : temperature for soft-L0 sigmoid (higher → harder threshold).
-
-    Returns
-    -------
-    (tv_loss, l0_loss) — both scalar tensors with gradients.
-
-    Gradient estimation cost
-    ------------------------
-    3 model forwards over `grad_sample_size` points.
-    """
     N = coords.shape[0]
 
     # ── Subsample from the already-resident target_coords ─────────────────
@@ -145,7 +124,6 @@ def compute_gradient_losses(
         pred, _ = model(c_model, variance=None, stochastic_alpha=stochastic_alpha)
         return pred   # (S,)
 
-    # ── 3 compact model forwards ──────────────────────────────────────────
     val_c = _forward(pts)
     val_y = _forward(pts_y)
     val_x = _forward(pts_x)
@@ -153,20 +131,12 @@ def compute_gradient_losses(
     dy = (val_y - val_c) / fd_eps
     dx = (val_x - val_c) / fd_eps
 
-    # ── TV loss: L1 on each gradient component (isotropic L1-TV) ─────────
-    # Minimising this suppresses noise-driven small gradients uniformly.
     tv_loss = (dy.abs() + dx.abs()).mean()
 
-    # ── Soft-L0 loss: sigmoid approximation of L0 gradient sparsity ───────
-    # sigmoid(β·‖∇‖ − 1) ≈ 0 when ‖∇‖ ≈ 0  (flat region, no penalty)
-    #                      ≈ 1 when ‖∇‖ >> 1/β  (large gradient, no penalty)
-    #                      ≈ 0.5 at ‖∇‖ = 1/β  (penalises the "mushy middle")
-    # Minimising this drives gradients toward either 0 or large values —
-    # exactly the polarisation needed for sharp edges.
-    grad_mag = torch.sqrt(dy ** 2 + dx ** 2 + 1e-8)
-    l0_loss = torch.sigmoid(l0_beta * grad_mag - 1.0).mean()
+    grad_mag_sq = dy ** 2 + dx ** 2
+    welsch_loss = (1.0 - torch.exp(-grad_mag_sq / (2.0 * welsch_sigma ** 2))).mean()
 
-    return tv_loss, l0_loss
+    return tv_loss, welsch_loss
 
 
 def psf_uniform_sampling_step(
@@ -180,10 +150,11 @@ def psf_uniform_sampling_step(
     stochastic_alpha: float = 0.0,
     # ── sharpness regularisation ─────────────────────────────────────────
     lambda_tv: float = 0.0,
-    lambda_l0: float = 0.0,
+    lambda_welsch: float = 0.0,      # was: lambda_l0
     grad_sample_size: int = 50_000,
     fd_eps: float = 1e-3,
-    l0_beta: float = 10.0,
+    welsch_sigma: float = 5.0,       # was: l0_beta
+    model_chunk_size: int = 1_000_000,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
@@ -211,7 +182,12 @@ def psf_uniform_sampling_step(
     ], dim=-1).float()
     coords_for_model.requires_grad_(False)
 
-    pred_flat, _ = model(coords_for_model, variance=None, stochastic_alpha=stochastic_alpha)
+    pred_chunks = []
+    for i in range(0, coords_for_model.shape[0], model_chunk_size):
+        chunk = coords_for_model[i : i + model_chunk_size]
+        pred_chunk, _ = model(chunk, variance=None, stochastic_alpha=stochastic_alpha)
+        pred_chunks.append(pred_chunk)
+    pred_flat = torch.cat(pred_chunks, dim=0)
     pred_samples = pred_flat.view(num_pixels, num_mc_samples)
     simulated_values = pred_samples.mean(dim=1)
 
@@ -220,21 +196,18 @@ def psf_uniform_sampling_step(
 
     result = {
         "reconstruction_loss": data_loss * 100,
-        "tv_loss": torch.zeros(1, device=device),
-        "l0_loss": torch.zeros(1, device=device),
-        "total_loss": total_loss,
+        "tv_loss":      torch.zeros(1, device=device),
+        "welsch_loss":  torch.zeros(1, device=device),   # was: l0_loss
+        "total_loss":   total_loss,
     }
 
-    # ── Sharpness regularisation (TV + soft-L0) ───────────────────────────
-    # Both terms reuse target_coords already on GPU — no extra data transfer.
-    # Cost: 3 model forwards over grad_sample_size points.
-    if lambda_tv > 0.0 or lambda_l0 > 0.0:
-        tv_loss, l0_loss = compute_gradient_losses(
+    if lambda_tv > 0.0 or lambda_welsch > 0.0:
+        tv_loss, welsch_loss = compute_gradient_losses(
             model=model,
             coords=target_coords,
             grad_sample_size=grad_sample_size,
             fd_eps=fd_eps,
-            l0_beta=l0_beta,
+            welsch_sigma=welsch_sigma,            # was: l0_beta=l0_beta
             stochastic_alpha=stochastic_alpha,
         )
 
@@ -242,26 +215,28 @@ def psf_uniform_sampling_step(
             total_loss = total_loss + lambda_tv * tv_loss
             result["tv_loss"] = tv_loss
 
-        if lambda_l0 > 0.0:
-            total_loss = total_loss + lambda_l0 * l0_loss
-            result["l0_loss"] = l0_loss
+        if lambda_welsch > 0.0:                           # was: lambda_l0
+            total_loss = total_loss + lambda_welsch * welsch_loss
+            result["welsch_loss"] = welsch_loss           # was: l0_loss
 
     result["total_loss"] = total_loss
     return result
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/temp/W_DIP/datasets/levin/blur/im1_kernel1_img.png")
+    parser.add_argument("--image_path", type=str, default="/workspace/temp/W_DIP/datasets/levin/blur/im1_kernel2_img.png")
     parser.add_argument("--psf_path", type=str, default=None,
                         help="Path to discrete 2D PSF file (image or .npy). "
                              "Required for 'discrete' mode or 'gmm' without --gmm_checkpoint.")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/im1_kernel1_img.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/im1_kernel1_img")
+    parser.add_argument("--save_path", type=str, default="../checkpoints/im1_kernel2_img.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/im1_kernel2_img")
     parser.add_argument("--num_mc_samples", type=int, default=100, help="Number of PSF samples per pixel")
-    parser.add_argument("--num_pixels_per_step", type=int, default=180000, help="Number of pixels per step")
+    parser.add_argument("--model_chunk_size", type=int, default=1_000_000,
+                        help="Max coords per model forward pass (avoids cuBLAS size limits)")
     parser.add_argument("--progressive_steps", type=int, default=300, help="Number of steps to unlock progressively")
 
     # Stochastic training params
@@ -284,30 +259,34 @@ def main():
     # PSF sampling mode
     parser.add_argument("--psf_mode", type=str, default="gmm", choices=["discrete", "gmm"],
                         help="PSF sampling mode: 'discrete' or 'gmm'")
-    parser.add_argument("--gmm_checkpoint", type=str, default="../checkpoints/levin_kernel1.pkl",
+    parser.add_argument("--gmm_checkpoint", type=str, default="../checkpoints/levin_kernel2.pkl",
                         help="[gmm mode] Path to a pre-fitted GMMPsf .pkl file (from gmm_psf.py).")
 
-    # ── Sharpness regularisation ──────────────────────────────────────────
-    parser.add_argument("--lambda_tv", type=float, default=1e-5,
-                        help="Weight for L1-TV loss. Suppresses noise-driven small gradients. "
-                             "Suggested starting range: 1e-4 ~ 1e-2. Default 0 (disabled).")
-    parser.add_argument("--lambda_l0", type=float, default=1e-3,
-                        help="Weight for soft-L0 gradient loss. Polarises gradients toward "
-                             "0-or-large, sharpening edges. Suggested range: 1e-3 ~ 1e-1. "
-                             "Default 0 (disabled).")
+    parser.add_argument("--lambda_tv", type=float, default=1e-3,
+                        help="Weight for L1-TV loss (stage 1, early training). "
+                             "Suppresses hash-grid noise. Suggested: 1e-4 ~ 1e-2.")
+    parser.add_argument("--lambda_welsch", type=float, default=0.0,
+                        help="Weight for Welsch gradient loss (stage 2, late training). "
+                             "Polarises gradients toward 0-or-large → sharpens edges. "
+                             "Suggested: 5e-4 ~ 5e-3.")
+    parser.add_argument("--tv_end_fraction", type=float, default=1.0,
+                        help="Fraction of total steps at which TV switches OFF. "
+                             "E.g. 0.4 → TV active for steps ")
+    parser.add_argument("--welsch_start_fraction", type=float, default=0.4,
+                        help="Fraction of total steps at which Welsch switches ON. "
+                             "Set equal to tv_end_fraction for instant switch (recommended). "
+                             "Set higher to insert a no-reg gap between stages.")
     parser.add_argument("--grad_sample_size", type=int, default=50_000,
                         help="Points subsampled from target_coords for gradient estimation.")
-    parser.add_argument("--fd_eps", type=float, default=1e-3,
-                        help="Finite-difference step size in normalised [0,1] coordinates. "
-                            "~1e-3 is roughly one pixel for a 1000-pixel axis.")
-    parser.add_argument("--l0_beta", type=float, default=10.0,
-                        help="Temperature for soft-L0 sigmoid. Higher = harder threshold. "
-                             "Threshold sits at grad_mag = 1/beta (default: 0.1 normalised units).")
-    parser.add_argument("--reg_warmup_fraction", type=float, default=0,
-                        help="Fraction of total steps before regularisation is switched on. "
-                             "E.g. 0.3 means TV+L0 start at 30%% of training. Default 0 (always on).")
+    parser.add_argument("--welsch_sigma", type=float, default=5.0,
+                        help="Welsch saturation threshold (normalised-coord gradient units). "
+                             "Gradients >> sigma → treated as edges, left unpenalised. "
+                             "Rule of thumb: sigma ≈ 0.3 / fd_eps for a medium-contrast edge.")
 
     args = parser.parse_args()
+
+    fd_eps = 3.0 / max(args.desired_resolution, 1)
+    print(f"fd_eps auto-set to {fd_eps:.5f}  (3 / desired_resolution={args.desired_resolution})")
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     os.makedirs(args.logdir, exist_ok=True)
@@ -332,6 +311,7 @@ def main():
             image_norm = image_norm / max_val
 
     print(f"Image loaded: shape={image_norm.shape}, dtype={image_norm.dtype}")
+    num_pixels_per_step = image_norm.shape[0] * image_norm.shape[1]
     n_dims = 2
 
     encoder_config = {
@@ -409,22 +389,25 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     writer = SummaryWriter(log_dir=args.logdir)
 
-    # ── Regularisation config summary ────────────────────────────────────
-    reg_enabled = args.lambda_tv > 0.0 or args.lambda_l0 > 0.0
-    reg_warmup_step = int(args.steps * args.reg_warmup_fraction)
+    tv_end_step       = int(args.steps * args.tv_end_fraction)
+    welsch_start_step = int(args.steps * args.welsch_start_fraction)
+    reg_enabled = args.lambda_tv > 0.0 or args.lambda_welsch > 0.0
     if reg_enabled:
-        print(f"\nSharpness regularisation enabled:")
-        print(f"  lambda_tv={args.lambda_tv}  lambda_l0={args.lambda_l0}")
-        print(f"  grad_sample_size={args.grad_sample_size}  fd_eps={args.fd_eps}  l0_beta={args.l0_beta}")
-        if reg_warmup_step > 0:
-            print(f"  Warm-up: regularisation activates at step {reg_warmup_step} "
-                  f"({args.reg_warmup_fraction*100:.0f}% of training)")
+        print(f"\nTwo-stage sharpness regularisation:")
+        print(f"  Stage 1 — TV     : steps [0, {tv_end_step})        lambda={args.lambda_tv}")
+        print(f"  Stage 2 — Welsch : steps [{welsch_start_step}, {args.steps}]  lambda={args.lambda_welsch}")
+        print(f"  welsch_sigma={args.welsch_sigma}  fd_eps={fd_eps:.5f}  grad_sample_size={args.grad_sample_size}")
+        if tv_end_step < welsch_start_step:
+            print(f"  Gap (no reg)     : steps [{tv_end_step}, {welsch_start_step})")
+        else:
+            print(f"  Instant switch at step {tv_end_step}.")
     else:
-        print("\nSharpness regularisation disabled (lambda_tv=0, lambda_l0=0). "
-              "Pass --lambda_tv / --lambda_l0 to enable.")
+        print("\nSharpness regularisation disabled (lambda_tv=0, lambda_welsch=0). "
+              "Pass --lambda_tv / --lambda_welsch to enable.")
+    # ═══════════════════════════════════════════════════════════════════════
 
     # ── PSF sampling mode setup ──────────────────────────────────────────
     gmm_psf = None
@@ -445,7 +428,7 @@ def main():
 
     dataset = ImageDataset(
         norm_image_tensor=image_norm,
-        num_pixels_per_step=args.num_pixels_per_step,
+        num_pixels_per_step=num_pixels_per_step,
         num_batches=args.steps,
     )
     inv_shape = dataset.inv_shape  # keep a reference for the training step
@@ -454,7 +437,7 @@ def main():
         dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=8,
+        num_workers=0,
     )
     data_iter = iter(dataloader)
 
@@ -498,9 +481,8 @@ def main():
         else:
             current_alpha = 0.0
 
-        # Disable regularisation until warm-up step is reached
-        step_lambda_tv = args.lambda_tv if step >= reg_warmup_step else 0.0
-        step_lambda_l0 = args.lambda_l0 if step >= reg_warmup_step else 0.0
+        step_lambda_tv     = args.lambda_tv     if step < tv_end_step       else 0.0
+        step_lambda_welsch = args.lambda_welsch if step >= welsch_start_step else 0.0
 
         loss_dict = psf_uniform_sampling_step(
             model=model,
@@ -512,10 +494,11 @@ def main():
             gmm_psf=gmm_psf,
             stochastic_alpha=current_alpha,
             lambda_tv=step_lambda_tv,
-            lambda_l0=step_lambda_l0,
+            lambda_welsch=step_lambda_welsch,    # was: lambda_l0
             grad_sample_size=args.grad_sample_size,
-            fd_eps=args.fd_eps,
-            l0_beta=args.l0_beta,
+            fd_eps=fd_eps,
+            welsch_sigma=args.welsch_sigma,      # was: l0_beta
+            model_chunk_size=args.model_chunk_size,
         )
 
         for key, value in loss_dict.items():
@@ -539,11 +522,11 @@ def main():
         postfix_dict = {
             'recon_loss': f'{loss_dict["reconstruction_loss"].item():.6f}',
         }
-        if reg_enabled and step >= reg_warmup_step:
-            if args.lambda_tv > 0.0:
+        if reg_enabled:
+            if step_lambda_tv > 0.0:
                 postfix_dict['tv'] = f'{loss_dict["tv_loss"].item():.4f}'
-            if args.lambda_l0 > 0.0:
-                postfix_dict['l0'] = f'{loss_dict["l0_loss"].item():.4f}'
+            if step_lambda_welsch > 0.0:
+                postfix_dict['welsch'] = f'{loss_dict["welsch_loss"].item():.4f}'
         if current_alpha > 1e-5:
             postfix_dict['sp_alpha'] = f'{current_alpha:.4f}'
         pbar.set_postfix(postfix_dict)

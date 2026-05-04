@@ -16,3 +16,4 @@ README.md
 
 non-blind-deconv/gt_dragon.ply
 inference_2d/
+runs/

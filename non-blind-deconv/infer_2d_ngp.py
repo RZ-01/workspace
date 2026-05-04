@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity, mean_squared_error
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,13 +45,6 @@ def load_gray_norm(path: str) -> np.ndarray:
         img = img / 255.0          # assume uint8 range
     return img
 
-
-def psnr(pred: np.ndarray, gt: np.ndarray) -> float:
-    """PSNR in dB. Both arrays must be float32 in [0, 1]."""
-    mse = float(np.mean((pred - gt) ** 2))
-    if mse == 0.0:
-        return float("inf")
-    return 10.0 * np.log10(1.0 / mse)
 
 
 def build_2d_coords(height: int, width: int, device: torch.device) -> torch.Tensor:
@@ -82,10 +76,15 @@ def infer_image(model: InstantNGPTorchModel, height: int, width: int,
     return img
 
 
-def error_map(pred: np.ndarray, gt: np.ndarray, cmap: str = "hot") -> np.ndarray:
-    """Absolute error as an RGB uint8 image."""
-    err = np.abs(pred - gt)            # [0, 1]
-    err_norm = err / max(err.max(), 1e-8)
+def error_map(pred: np.ndarray, gt: np.ndarray, cmap: str = "hot",
+              vmax: float | None = None) -> np.ndarray:
+    """Absolute error as an RGB uint8 image.
+
+    Pass vmax to use a shared scale across multiple error maps.
+    """
+    err = np.abs(pred - gt)
+    scale = vmax if vmax is not None else max(float(err.max()), 1e-8)
+    err_norm = np.clip(err / scale, 0.0, 1.0)
     cmap_fn = plt.get_cmap(cmap)
     rgb = (cmap_fn(err_norm)[:, :, :3] * 255).astype(np.uint8)
     return rgb
@@ -93,53 +92,63 @@ def error_map(pred: np.ndarray, gt: np.ndarray, cmap: str = "hot") -> np.ndarray
 
 def save_comparison(gt: np.ndarray, inferred: np.ndarray,
                     baseline: np.ndarray | None,
-                    psnr_inferred: float, psnr_baseline: float | None,
+                    psnr_inferred: float, ssim_inferred: float, mse_inferred: float,
+                    psnr_baseline: float | None, ssim_baseline: float | None, mse_baseline: float | None,
                     out_path: str):
     """
-    Side-by-side figure.
-
-    Without baseline : [GT | Inferred | Error(Inferred vs GT)]
-    With baseline    : [GT | Inferred | Error(Inferred) | Baseline | Error(Baseline)]
+    Without baseline : 1 row  [GT | Inferred | Error(Inferred vs GT)]
+    With baseline    : 2 rows  row0: [GT | Inferred | Error(Inferred vs GT)]
+                               row1: [GT | Baseline | Error(Baseline vs GT)]
     """
     def to_rgb(arr: np.ndarray) -> np.ndarray:
         return np.stack([arr, arr, arr], axis=-1)
 
     gt_rgb  = to_rgb(gt)
     inf_rgb = to_rgb(inferred)
-    err_inf = error_map(inferred, gt)
 
     if baseline is not None:
-        err_bas = error_map(baseline, gt)
-        bas_rgb = to_rgb(baseline)
-        panels = [gt_rgb, inf_rgb, err_inf, bas_rgb, err_bas]
-        titles = [
-            "GT",
-            f"Inferred  PSNR={psnr_inferred:.2f} dB",
-            "Error (Inferred vs GT)",
-            f"Baseline  PSNR={psnr_baseline:.2f} dB",
-            "Error (Baseline vs GT)",
+        shared_vmax = max(
+            float(np.abs(inferred - gt).max()),
+            float(np.abs(baseline - gt).max()),
+            1e-8,
+        )
+        err_inf = error_map(inferred, gt, vmax=shared_vmax)
+        err_bas = error_map(baseline, gt, vmax=shared_vmax)
+        bas_rgb  = to_rgb(baseline)
+        rows = [
+            [gt_rgb,  inf_rgb, err_inf],
+            [gt_rgb,  bas_rgb, err_bas],
         ]
+        titles = [
+            ["GT",
+             f"Inferred  PSNR={psnr_inferred:.2f} dB  SSIM={ssim_inferred:.4f}  MSE={mse_inferred:.2e}",
+             "Error (Inferred vs GT)"],
+            ["GT",
+             f"Baseline  PSNR={psnr_baseline:.2f} dB  SSIM={ssim_baseline:.4f}  MSE={mse_baseline:.2e}",
+             "Error (Baseline vs GT)"],
+        ]
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=150,
+                                 gridspec_kw={"wspace": 0.05, "hspace": 0.08})
+        for r, (row_panels, row_titles) in enumerate(zip(rows, titles)):
+            for c, (panel, title) in enumerate(zip(row_panels, row_titles)):
+                axes[r, c].imshow(panel)
+                axes[r, c].set_title(title, fontsize=8, pad=4)
+                axes[r, c].axis("off")
     else:
+        err_inf = error_map(inferred, gt)
         panels = [gt_rgb, inf_rgb, err_inf]
         titles = [
             "GT",
-            f"Inferred  PSNR={psnr_inferred:.2f} dB",
+            f"Inferred  PSNR={psnr_inferred:.2f} dB  SSIM={ssim_inferred:.4f}  MSE={mse_inferred:.2e}",
             "Error (Inferred vs GT)",
         ]
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4), dpi=150,
+                                 gridspec_kw={"wspace": 0.05})
+        for ax, panel, title in zip(axes, panels, titles):
+            ax.imshow(panel)
+            ax.set_title(title, fontsize=8, pad=4)
+            ax.axis("off")
 
-    n = len(panels)
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), dpi=150,
-                             gridspec_kw={"wspace": 0.05})
-    if n == 1:
-        axes = [axes]
-
-    for ax, panel, title in zip(axes, panels, titles):
-        ax.imshow(panel)
-        ax.set_title(title, fontsize=8, pad=4)
-        ax.axis("off")
-
-    # Shared colorbar for error maps (always the last one or two panels)
-    # Simple: add a label instead
     fig.suptitle("Comparison", fontsize=10, y=1.01)
     plt.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
@@ -218,22 +227,26 @@ def main():
     gt_01       = gt.clip(0, 1)
     inferred_01 = inferred.clip(0, 1)
 
-    psnr_inferred = psnr(inferred_01, gt_01)
-    print(f"\nPSNR (Inferred vs GT): {psnr_inferred:.4f} dB")
+    psnr_inferred = peak_signal_noise_ratio(gt_01, inferred_01, data_range=1.0)
+    ssim_inferred = structural_similarity(gt_01, inferred_01, data_range=1.0)
+    mse_inferred  = mean_squared_error(gt_01, inferred_01)
+    print(f"\nInferred vs GT:  PSNR={psnr_inferred:.4f} dB  SSIM={ssim_inferred:.6f}  MSE={mse_inferred:.6e}")
 
-    psnr_baseline = None
+    psnr_baseline = ssim_baseline = mse_baseline = None
     if baseline is not None:
-        baseline_01  = baseline.clip(0, 1)
-        psnr_baseline = psnr(baseline_01, gt_01)
-        print(f"PSNR (Baseline vs GT): {psnr_baseline:.4f} dB")
+        baseline_01   = baseline.clip(0, 1)
+        psnr_baseline = peak_signal_noise_ratio(gt_01, baseline_01, data_range=1.0)
+        ssim_baseline = structural_similarity(gt_01, baseline_01, data_range=1.0)
+        mse_baseline  = mean_squared_error(gt_01, baseline_01)
+        print(f"Baseline vs GT:  PSNR={psnr_baseline:.4f} dB  SSIM={ssim_baseline:.6f}  MSE={mse_baseline:.6e}")
 
-    # Save PSNR text
-    txt_path = os.path.join(args.out_dir, "psnr_results.txt")
+    # Save metrics
+    txt_path = os.path.join(args.out_dir, "metrics.txt")
     with open(txt_path, "w") as f:
-        f.write(f"Inferred vs GT : {psnr_inferred:.6f} dB\n")
+        f.write(f"Inferred vs GT : PSNR={psnr_inferred:.6f} dB  SSIM={ssim_inferred:.6f}  MSE={mse_inferred:.6e}\n")
         if psnr_baseline is not None:
-            f.write(f"Baseline vs GT : {psnr_baseline:.6f} dB\n")
-    print(f"Saved PSNR: {txt_path}")
+            f.write(f"Baseline vs GT : PSNR={psnr_baseline:.6f} dB  SSIM={ssim_baseline:.6f}  MSE={mse_baseline:.6e}\n")
+    print(f"Saved metrics: {txt_path}")
 
     # ── Comparison figure ─────────────────────────────────────────────────────
     comp_path = os.path.join(args.out_dir, "comparison.png")
@@ -241,8 +254,8 @@ def main():
         gt=gt_01,
         inferred=inferred_01,
         baseline=baseline_01 if baseline is not None else None,
-        psnr_inferred=psnr_inferred,
-        psnr_baseline=psnr_baseline,
+        psnr_inferred=psnr_inferred, ssim_inferred=ssim_inferred, mse_inferred=mse_inferred,
+        psnr_baseline=psnr_baseline, ssim_baseline=ssim_baseline, mse_baseline=mse_baseline,
         out_path=comp_path,
     )
 
