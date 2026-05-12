@@ -46,6 +46,21 @@ def load_gray_norm(path: str) -> np.ndarray:
     return img
 
 
+def align_to_reference(src: np.ndarray, ref: np.ndarray) -> tuple[np.ndarray, tuple[float, float]]:
+    """Align src to ref via phase correlation (sub-pixel translation only).
+
+    Returns the shifted image and (dx, dy) shift applied.
+    """
+    src_f32 = (src * 255).astype(np.float32)
+    ref_f32 = (ref * 255).astype(np.float32)
+    (dx, dy), _ = cv2.phaseCorrelate(src_f32, ref_f32)
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    H, W = src.shape
+    shifted = cv2.warpAffine(src, M, (W, H), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+    return shifted, (dx, dy)
+
+
 
 def build_2d_coords(height: int, width: int, device: torch.device) -> torch.Tensor:
     """Normalised (x, y) coordinate grid in [0, 1], shape (H*W, 2)."""
@@ -69,10 +84,7 @@ def infer_image(model: InstantNGPTorchModel, height: int, width: int,
         preds.append(pred.cpu())
     pred_flat = torch.cat(preds, dim=0).numpy()
     img = pred_flat.reshape(height, width).astype(np.float32)
-    # Normalise to [0, 1]
-    lo, hi = img.min(), img.max()
-    if hi > lo:
-        img = (img - lo) / (hi - lo)
+    img = np.clip(img, 0.0, 1.0)
     return img
 
 
@@ -83,6 +95,8 @@ def error_map(pred: np.ndarray, gt: np.ndarray, cmap: str = "hot",
     Pass vmax to use a shared scale across multiple error maps.
     """
     err = np.abs(pred - gt)
+    # 打印绝对误差的统计信息
+    print(f"  Error map stats: max={err.max():.6f}, mean={err.mean():.6f}, min={err.min():.6f}")
     scale = vmax if vmax is not None else max(float(err.max()), 1e-8)
     err_norm = np.clip(err / scale, 0.0, 1.0)
     cmap_fn = plt.get_cmap(cmap)
@@ -106,6 +120,12 @@ def save_comparison(gt: np.ndarray, inferred: np.ndarray,
     gt_rgb  = to_rgb(gt)
     inf_rgb = to_rgb(inferred)
 
+    H, W = gt.shape
+    aspect = W / H          # panel aspect ratio
+    col_w  = 5.0            # inches per column
+    n_cols = 3
+    fig_w  = col_w * n_cols
+
     if baseline is not None:
         shared_vmax = max(
             float(np.abs(inferred - gt).max()),
@@ -127,8 +147,11 @@ def save_comparison(gt: np.ndarray, inferred: np.ndarray,
              f"Baseline  PSNR={psnr_baseline:.2f} dB  SSIM={ssim_baseline:.4f}  MSE={mse_baseline:.2e}",
              "Error (Baseline vs GT)"],
         ]
-        fig, axes = plt.subplots(2, 3, figsize=(12, 8), dpi=150,
-                                 gridspec_kw={"wspace": 0.05, "hspace": 0.08})
+        title_h = 0.3       # inches reserved per row for the title text
+        row_h   = col_w / aspect + title_h
+        fig_h   = row_h * 2
+        fig, axes = plt.subplots(2, 3, figsize=(fig_w, fig_h),
+                                 gridspec_kw={"wspace": 0.05, "hspace": 0.15})
         for r, (row_panels, row_titles) in enumerate(zip(rows, titles)):
             for c, (panel, title) in enumerate(zip(row_panels, row_titles)):
                 axes[r, c].imshow(panel)
@@ -142,14 +165,14 @@ def save_comparison(gt: np.ndarray, inferred: np.ndarray,
             f"Inferred  PSNR={psnr_inferred:.2f} dB  SSIM={ssim_inferred:.4f}  MSE={mse_inferred:.2e}",
             "Error (Inferred vs GT)",
         ]
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4), dpi=150,
+        fig_h = col_w / aspect + 0.3
+        fig, axes = plt.subplots(1, 3, figsize=(fig_w, fig_h),
                                  gridspec_kw={"wspace": 0.05})
         for ax, panel, title in zip(axes, panels, titles):
             ax.imshow(panel)
             ax.set_title(title, fontsize=8, pad=4)
             ax.axis("off")
 
-    fig.suptitle("Comparison", fontsize=10, y=1.01)
     plt.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -191,6 +214,8 @@ def main():
         if baseline_raw.shape != gt.shape:
             print(f"  Resizing baseline {baseline_raw.shape} → {gt.shape}")
             baseline_raw = cv2.resize(baseline_raw, (W, H), interpolation=cv2.INTER_LINEAR)
+        baseline_raw, (dx, dy) = align_to_reference(baseline_raw, gt)
+        print(f"  Aligned baseline: shift = ({dx:.2f}, {dy:.2f}) px")
         baseline = baseline_raw
 
     # ── Load model ────────────────────────────────────────────────────────────
@@ -215,6 +240,8 @@ def main():
     print(f"Inferring image ({H}x{W})…")
     inferred = infer_image(model, H, W, device, batch_size=args.batch_size)
     print(f"  Inferred range: [{inferred.min():.4f}, {inferred.max():.4f}]")
+    inferred, (dx, dy) = align_to_reference(inferred, gt)
+    print(f"  Aligned inferred: shift = ({dx:.2f}, {dy:.2f}) px")
 
     # Save raw inferred image
     inferred_uint8 = (inferred * 255).clip(0, 255).astype(np.uint8)
@@ -249,7 +276,7 @@ def main():
     print(f"Saved metrics: {txt_path}")
 
     # ── Comparison figure ─────────────────────────────────────────────────────
-    comp_path = os.path.join(args.out_dir, "comparison.png")
+    comp_path = os.path.join(args.out_dir, "comparison.pdf")
     save_comparison(
         gt=gt_01,
         inferred=inferred_01,

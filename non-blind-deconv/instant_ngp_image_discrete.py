@@ -12,20 +12,6 @@ from tqdm import tqdm
 
 from models.instantngp import InstantNGPTorchModel
 
-def gradient_prior_loss(model, H, W, patch_size, device, p=0.66, stochastic_alpha=0.0):
-    y0 = torch.randint(0, H - patch_size + 1, (1,)).item()
-    x0 = torch.randint(0, W - patch_size + 1, (1,)).item()
-    ys = torch.arange(y0, y0 + patch_size, device=device).float() / max(H - 1, 1)
-    xs = torch.arange(x0, x0 + patch_size, device=device).float() / max(W - 1, 1)
-    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    coords = torch.stack([gx, gy], dim=-1).view(-1, 2)
-    pred, _ = model(coords, variance=None, stochastic_alpha=stochastic_alpha)
-    pred = pred.view(patch_size, patch_size)
-    dx = pred[:, 1:] - pred[:, :-1]
-    dy = pred[1:, :] - pred[:-1, :]
-    eps = 1e-6
-    return (dx.abs() + eps).pow(p).mean() + (dy.abs() + eps).pow(p).mean()
-
 class ImageDataset(Dataset):
     def __init__(self, norm_image_tensor, num_pixels_per_step, num_batches):
         self.norm_image_tensor = norm_image_tensor
@@ -137,28 +123,28 @@ def psf_uniform_sampling_step(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image_path", type=str, default="/workspace/temp/W_DIP/datasets/micro_bad/blur/im0_k0.png")
-    parser.add_argument("--psf_path", type=str, default="/workspace/temp/W_DIP/datasets/micro_bad/gt/k0.png",
+    parser.add_argument("--image_path", type=str, default="/workspace/temp/dataset/blur/saturated_img4_kernel2.png")
+    parser.add_argument("--psf_path", type=str, default="/workspace/temp/dataset/kernel/kernel2.png",
                         help="Path to discrete 2D PSF file (image or .npy).")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/micro_discrete.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/micro_discrete")
+    parser.add_argument("--save_path", type=str, default="../checkpoints/saturated_img4_kernel2.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/saturated_img4_kernel2")
     parser.add_argument("--num_mc_samples", type=int, default=300)
     parser.add_argument("--progressive_steps", type=int, default=300)
     parser.add_argument("--num_pixels_per_step", type=int, default=180000,
                         help="Number of pixels sampled per training step (default: 4096).")
 
     # Stochastic preconditioning
-    parser.add_argument("--sp_alpha_init", type=float, default=0.0)
+    parser.add_argument("--sp_alpha_init", type=float, default=0.03)
     parser.add_argument("--sp_decay_fraction", type=float, default=0.33)
 
     # Encoder config
-    parser.add_argument("--num_levels", type=int, default=16)
+    parser.add_argument("--num_levels", type=int, default=21)
     parser.add_argument("--level_dim", type=int, default=2)
     parser.add_argument("--base_resolution", type=int, default=16)
-    parser.add_argument("--log2_hashmap_size", type=int, default=21)
-    parser.add_argument("--desired_resolution", type=int, default=512)
+    parser.add_argument("--log2_hashmap_size", type=int, default=24)
+    parser.add_argument("--desired_resolution", type=int, default=1600)
 
     # Decoder config
     parser.add_argument("--hidden_dim", type=int, default=64)
@@ -238,6 +224,8 @@ def main():
         raise ValueError("PSF sum must be positive.")
     discrete_psf_np /= psf_sum
     discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
+    # scipy.ndimage.convolve flips the kernel; flip here so the forward model matches
+    discrete_psf = torch.flip(discrete_psf, [0, 1])
     print(f"PSF loaded: shape={discrete_psf.shape}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)

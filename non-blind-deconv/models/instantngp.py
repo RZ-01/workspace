@@ -278,7 +278,7 @@ class InstantNGPTorchModel(nn.Module):
             output = output.float()
             
             # Apply Softplus to ensure output > 0 (strictly positive)
-            #output = F.softplus(output)
+            output = F.sigmoid(output)
 
             if self.learn_variance:
                 return output[..., 0], output[..., 1]
