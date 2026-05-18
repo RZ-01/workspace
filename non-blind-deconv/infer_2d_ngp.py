@@ -1,5 +1,4 @@
 """
-infer_compare.py
 ----------------
 Infer the INR-fitted image, compare against GT and an optional baseline.
 
@@ -62,21 +61,23 @@ def align_to_reference(src: np.ndarray, ref: np.ndarray) -> tuple[np.ndarray, tu
 
 
 
-def build_2d_coords(height: int, width: int, device: torch.device) -> torch.Tensor:
-    """Normalised (x, y) coordinate grid in [0, 1], shape (H*W, 2)."""
-    ys = torch.arange(height, device=device, dtype=torch.float32)
-    xs = torch.arange(width,  device=device, dtype=torch.float32)
-    ys_n = ys / max(height - 1, 1)
-    xs_n = xs / max(width  - 1, 1)
+def build_2d_coords(height: int, width: int, device: torch.device,
+                    pad_h: int = 0, pad_w: int = 0) -> torch.Tensor:
+    H_full = height + 2 * pad_h
+    W_full = width  + 2 * pad_w
+    ys = torch.arange(height, device=device, dtype=torch.float32) + pad_h
+    xs = torch.arange(width,  device=device, dtype=torch.float32) + pad_w
+    ys_n = ys / max(H_full - 1, 1)
+    xs_n = xs / max(W_full - 1, 1)
     gy, gx = torch.meshgrid(ys_n, xs_n, indexing="ij")
     return torch.stack([gx, gy], dim=-1).view(-1, 2)
 
 
 @torch.no_grad()
 def infer_image(model: InstantNGPTorchModel, height: int, width: int,
-                device: torch.device, batch_size: int = 500_000) -> np.ndarray:
-    """Run inference over the full image grid; return float32 [0,1] array."""
-    coords = build_2d_coords(height, width, device)
+                device: torch.device, batch_size: int = 500_000,
+                pad_h: int = 0, pad_w: int = 0) -> np.ndarray:
+    coords = build_2d_coords(height, width, device, pad_h=pad_h, pad_w=pad_w)
     preds = []
     for i in range(0, coords.shape[0], batch_size):
         chunk = coords[i : i + batch_size]
@@ -193,6 +194,8 @@ def main():
     parser.add_argument("--out_dir",      type=str, default="../inference_2d")
     parser.add_argument("--device",       type=str, default="cuda")
     parser.add_argument("--batch_size",   type=int, default=500_000)
+    parser.add_argument("--psf_path", type=str, default=None,
+                    help="PSF path (informational only; no longer used for coord shift).")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -204,6 +207,9 @@ def main():
     gt = load_gray_norm(args.gt_image)
     H, W = gt.shape
     print(f"  GT shape: {H} x {W}")
+
+    # Blur was generated with reflect-pad → INR domain == image domain, no coord shift needed
+    pad_h, pad_w = 0, 0
 
     # ── Load baseline (optional) ──────────────────────────────────────────────
     baseline = None
@@ -238,7 +244,9 @@ def main():
 
     # ── Infer ────────────────────────────────────────────────────────────────
     print(f"Inferring image ({H}x{W})…")
-    inferred = infer_image(model, H, W, device, batch_size=args.batch_size)
+    inferred = infer_image(model, H, W, device,
+                       batch_size=args.batch_size,
+                       pad_h=pad_h, pad_w=pad_w)
     print(f"  Inferred range: [{inferred.min():.4f}, {inferred.max():.4f}]")
     inferred, (dx, dy) = align_to_reference(inferred, gt)
     print(f"  Aligned inferred: shift = ({dx:.2f}, {dy:.2f}) px")

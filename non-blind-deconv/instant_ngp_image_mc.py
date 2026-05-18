@@ -18,16 +18,16 @@ class ImageDataset(Dataset):
         self.num_pixels_per_step = num_pixels_per_step
         self.num_batches = num_batches
         self.image_shape = norm_image_tensor.shape
+
         if len(self.image_shape) != 2:
             raise ValueError(f"Only 2D images are supported, got shape={self.image_shape}")
 
         h, w = self.image_shape
-        # INR [0,1] domain spans the blurry image directly (same size as sharp after reflect-pad blur)
         self.inv_shape = torch.tensor(
             [1.0 / max(h - 1, 1), 1.0 / max(w - 1, 1)],
             dtype=torch.float32,
         )
-   
+
     def __len__(self):
         return self.num_batches
 
@@ -35,18 +35,17 @@ class ImageDataset(Dataset):
         h, w = self.image_shape
         y_idx_t = torch.randint(0, h, (self.num_pixels_per_step,))
         x_idx_t = torch.randint(0, w, (self.num_pixels_per_step,))
+        target_coords = torch.stack([y_idx_t, x_idx_t], dim=1)
 
-        target_coords = torch.stack([y_idx_t, x_idx_t], dim=1).float()
-        target_coords_normalized = target_coords * self.inv_shape
-
-        y_idx = y_idx_t.numpy()
-        x_idx = x_idx_t.numpy()
+        y_idx = target_coords[:, 0].numpy()
+        x_idx = target_coords[:, 1].numpy()
         values = self.norm_image_tensor[y_idx, x_idx]
         target_values = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
+        target_coords_normalized = target_coords.float() * self.inv_shape
 
         return {
-            'target_coords': target_coords_normalized,
-            'target_values': target_values,
+            'target_coords': target_coords_normalized,   # (P, 2)
+            'target_values': target_values,              # (P,)
         }
 
 
@@ -76,73 +75,51 @@ def generate_offsets_on_gpu(
         x_idx.float() - (w - 1) / 2.0 + jitter[:, 1],
     ], dim=1)
 
-def precompute_psf_grid(
-    discrete_psf: torch.Tensor,
-    inv_shape: torch.Tensor,
-    device: torch.device,
-):
-    """
-    Returns:
-        psf_offsets_norm: (K, 2) deterministic offsets in normalized image coords,
-                          K = H_psf * W_psf
-        psf_weights:      (K,)   PSF weights, already sum to 1
-    """
-    H, W = discrete_psf.shape
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device=device, dtype=torch.float32),
-        torch.arange(W, device=device, dtype=torch.float32),
-        indexing='ij',
-    )
-    offsets_pix = torch.stack([
-        yy - (H - 1) / 2.0,
-        xx - (W - 1) / 2.0,
-    ], dim=-1).view(-1, 2)                          # (K, 2) in PSF-pixel units
 
-    psf_offsets_norm = offsets_pix * inv_shape.to(device)   # (K, 2) in normalized coords
-    psf_weights = discrete_psf.flatten().contiguous()       # (K,)
-    return psf_offsets_norm, psf_weights
-
-def psf_deterministic_step(
+def psf_uniform_sampling_step(
     model: nn.Module,
     batch: dict,
-    psf_offsets_norm: torch.Tensor,   # (K, 2)
-    psf_weights: torch.Tensor,        # (K,)
+    num_mc_samples: int,
     device: torch.device,
+    discrete_psf: torch.Tensor,
+    inv_shape: torch.Tensor,
     stochastic_alpha: float = 0.0,
-    use_reflect: bool = True,
 ) -> dict:
-    target_coords = batch['target_coords'].to(device, non_blocking=True)  # (P, 2)
-    target_values = batch['target_values'].to(device, non_blocking=True)  # (P,)
+    target_coords = batch['target_coords'].to(device, non_blocking=True)
+    target_values = batch['target_values'].to(device, non_blocking=True)
 
-    P = target_coords.shape[0]
-    K = psf_offsets_norm.shape[0]
+    num_pixels = target_coords.shape[0]
+    n_dims = target_coords.shape[1]
+    sampling_budget = num_pixels * num_mc_samples
 
-    # (P, 1, 2) + (1, K, 2) -> (P, K, 2)
-    source_coords = target_coords.unsqueeze(1) + psf_offsets_norm.unsqueeze(0)
+    sampled_offsets = generate_offsets_on_gpu(
+        sampling_budget, discrete_psf=discrete_psf, device=device,
+    )  # (N, 2), pixel units
 
-    # Boundary handling
-    if use_reflect:
-        # triangle reflect into [0, 1] (works for small offsets; safe clamp at the end)
-        s = source_coords.abs()
-        source_coords = 1.0 - (s - 1.0).abs()
-        source_coords = source_coords.clamp(0.0, 1.0)
-    else:
-        source_coords = source_coords.clamp(0.0, 1.0)
+    inv_shape_gpu = inv_shape.to(device, non_blocking=True)
+    sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
 
-    source_flat = source_coords.reshape(-1, 2)
-    coords_for_model = torch.stack([source_flat[:, 1], source_flat[:, 0]], dim=-1)
+    source_coords = target_coords.unsqueeze(1) + sampled_offsets
+    source_coords = torch.clamp(source_coords, 0.0, 1.0)
+    source_coords_flat = source_coords.view(-1, n_dims)
+
+    coords_for_model = torch.stack([
+        source_coords_flat[:, 1],
+        source_coords_flat[:, 0],
+    ], dim=-1).float()
+    coords_for_model.requires_grad_(False)
 
     pred_flat, _ = model(coords_for_model, variance=None, stochastic_alpha=stochastic_alpha)
-    pred = pred_flat.view(P, K)                            # (P, K)
-
-    # Deterministic weighted sum = (sharp ⊛ PSF) at target pixel
-    simulated_values = (pred * psf_weights.unsqueeze(0)).sum(dim=1)   # (P,)
+    pred_samples = pred_flat.view(num_pixels, num_mc_samples)
+    simulated_values = pred_samples.mean(dim=1)
 
     data_loss = F.mse_loss(simulated_values.float(), target_values.float()) * 100
+
     return {
         "reconstruction_loss": data_loss,
         "total_loss":          data_loss,
     }
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -150,12 +127,12 @@ def main():
     parser.add_argument("--psf_path", type=str, default="/workspace/nonblind/Deblur-INR/results/ker04_truth.png",
                         help="Path to discrete 2D PSF file (image or .npy).")
     parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=5e-3)
-    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04.pth")
-    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04")
-    parser.add_argument("--num_mc_samples", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_mc.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_mc")
+    parser.add_argument("--num_mc_samples", type=int, default=800)
     parser.add_argument("--progressive_steps", type=int, default=300)
-    parser.add_argument("--num_pixels_per_step", type=int, default=24000,
+    parser.add_argument("--num_pixels_per_step", type=int, default=10000,
                         help="Number of pixels sampled per training step (default: 4096).")
 
     # Stochastic preconditioning
@@ -251,26 +228,17 @@ def main():
     discrete_psf = torch.flip(discrete_psf, [0, 1])
     print(f"PSF loaded: shape={discrete_psf.shape}")
 
-
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
     scaler = torch.amp.GradScaler('cuda')
     writer = SummaryWriter(log_dir=args.logdir)
 
-    h_img, w_img = image_norm.shape
-    inv_shape = torch.tensor(
-        [1.0 / max(h_img - 1, 1), 1.0 / max(w_img - 1, 1)],
-        dtype=torch.float32,
-    )
     dataset = ImageDataset(
         norm_image_tensor=image_norm,
         num_pixels_per_step=num_pixels_per_step,
         num_batches=args.steps,
     )
-
-    psf_offsets_norm, psf_weights = precompute_psf_grid(discrete_psf, inv_shape, device)
-    print(f"PSF grid: {psf_offsets_norm.shape[0]} deterministic samples per target pixel")
-
+    inv_shape = dataset.inv_shape
 
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     data_iter = iter(dataloader)
@@ -300,14 +268,14 @@ def main():
         else:
             current_alpha = 0.0
 
-        loss_dict = psf_deterministic_step(
+        loss_dict = psf_uniform_sampling_step(
             model=model,
             batch=batch,
-            psf_offsets_norm=psf_offsets_norm,
-            psf_weights=psf_weights,
+            num_mc_samples=args.num_mc_samples,
             device=device,
+            discrete_psf=discrete_psf,
+            inv_shape=inv_shape,
             stochastic_alpha=current_alpha,
-            use_reflect=True,
         )
 
         for key, value in loss_dict.items():

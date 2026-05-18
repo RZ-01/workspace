@@ -1,71 +1,79 @@
 import argparse
 import os
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tifffile
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from models.nglod import NglodModel
-from sample_strategy.random_sample import sample_random_coords
 
-
-class VolumeDataset(Dataset):
-    def __init__(self, norm_volume_tensor, num_mc_samples, num_pixels_per_step, num_batches, discrete_psf):
-        self.norm_volume_tensor = norm_volume_tensor
-        self.num_mc_samples = num_mc_samples
+class ImageDataset(Dataset):
+    def __init__(self, norm_image_tensor, num_pixels_per_step, num_batches):
+        self.norm_image_tensor = norm_image_tensor
         self.num_pixels_per_step = num_pixels_per_step
         self.num_batches = num_batches
-        self.volume_shape = norm_volume_tensor.shape
-        self.discrete_psf = discrete_psf.cpu()
+        self.image_shape = norm_image_tensor.shape
 
-        vz, vy, vx = self.volume_shape
-        self.inv_shape = torch.tensor([1.0 / (vz - 1), 1.0 / (vy - 1), 1.0 / (vx - 1)], dtype=torch.float32)
+        if len(self.image_shape) != 2:
+            raise ValueError(f"Only 2D images are supported, got shape={self.image_shape}")
+
+        h, w = self.image_shape
+        self.inv_shape = torch.tensor(
+            [1.0 / max(h - 1, 1), 1.0 / max(w - 1, 1)],
+            dtype=torch.float32,
+        )
 
     def __len__(self):
         return self.num_batches
 
-    def _generate_offsets(self):
-        sampling_budget = self.num_mc_samples * self.num_pixels_per_step
-        psf_shape = self.discrete_psf.shape
-
-        psf_flat = self.discrete_psf.flatten()
-        psf_flat = psf_flat / psf_flat.sum()
-        sampled_indices = torch.multinomial(psf_flat, sampling_budget, replacement=True)
-
-        d, h, w = psf_shape
-        z_idx = sampled_indices // (h * w)
-        y_idx = (sampled_indices % (h * w)) // w
-        x_idx = sampled_indices % w
-        offsets = torch.stack([
-            z_idx.float() - (d - 1) / 2.0,
-            y_idx.float() - (h - 1) / 2.0,
-            x_idx.float() - (w - 1) / 2.0,
-        ], dim=1)
-
-        return offsets
-
     def __getitem__(self, idx):
-        target_coords = sample_random_coords(self.num_pixels_per_step, self.volume_shape)
+        h, w = self.image_shape
+        y_idx_t = torch.randint(0, h, (self.num_pixels_per_step,))
+        x_idx_t = torch.randint(0, w, (self.num_pixels_per_step,))
+        target_coords = torch.stack([y_idx_t, x_idx_t], dim=1)
 
-        z_idx = target_coords[:, 0].numpy()
-        y_idx = target_coords[:, 1].numpy()
-        x_idx = target_coords[:, 2].numpy()
-        values = self.norm_volume_tensor[z_idx, y_idx, x_idx]
-        target_values = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)) / 65535.0
-
-        sampled_offsets = self._generate_offsets()
+        y_idx = target_coords[:, 0].numpy()
+        x_idx = target_coords[:, 1].numpy()
+        values = self.norm_image_tensor[y_idx, x_idx]
+        target_values = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
         target_coords_normalized = target_coords.float() * self.inv_shape
-        sampled_offsets_normalized = sampled_offsets.float() * self.inv_shape
 
         return {
-            'target_coords': target_coords_normalized,
-            'target_values': target_values,
-            'sampled_offsets': sampled_offsets_normalized,
+            'target_coords': target_coords_normalized,   # (P, 2)
+            'target_values': target_values,              # (P,)
         }
+
+
+def generate_offsets_on_gpu(
+    n: int,
+    discrete_psf: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Sample n PSF offsets on the GPU.
+
+    Steps:
+      1. Sample a histogram bin via multinomial (integer pixel offset).
+      2. Add uniform jitter within that pixel: U(-0.5, +0.5) per axis.
+
+    Returns offsets of shape (n, 2), float32, in pixel units centred at PSF origin.
+    """
+    psf_flat = discrete_psf.flatten()
+    psf_flat = psf_flat / psf_flat.sum()
+    idx = torch.multinomial(psf_flat, n, replacement=True)
+    h, w = discrete_psf.shape
+    y_idx = idx // w
+    x_idx = idx % w
+    jitter = torch.rand((n, 2), device=device) - 0.5
+    return torch.stack([
+        y_idx.float() - (h - 1) / 2.0 + jitter[:, 0],
+        x_idx.float() - (w - 1) / 2.0 + jitter[:, 1],
+    ], dim=1)
 
 
 def psf_uniform_sampling_step(
@@ -73,62 +81,77 @@ def psf_uniform_sampling_step(
     batch: dict,
     num_mc_samples: int,
     device: torch.device,
+    discrete_psf: torch.Tensor,
+    inv_shape: torch.Tensor,
+    stochastic_alpha: float = 0.0,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
-    sampled_offsets = batch['sampled_offsets'].to(device, non_blocking=True)
 
     num_pixels = target_coords.shape[0]
     n_dims = target_coords.shape[1]
-    sampled_offsets = sampled_offsets.view(num_pixels, num_mc_samples, n_dims)
+    sampling_budget = num_pixels * num_mc_samples
+
+    sampled_offsets = generate_offsets_on_gpu(
+        sampling_budget, discrete_psf=discrete_psf, device=device,
+    )  # (N, 2), pixel units
+
+    inv_shape_gpu = inv_shape.to(device, non_blocking=True)
+    sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
 
     source_coords = target_coords.unsqueeze(1) + sampled_offsets
     source_coords = torch.clamp(source_coords, 0.0, 1.0)
     source_coords_flat = source_coords.view(-1, n_dims)
 
-    # reorder z,y,x → x,y,z for model input
+    # NglodModel requires 3-D input; pad with a fixed z=0.5 (image lives at mid-plane)
     coords_for_model = torch.stack([
-        source_coords_flat[:, 2],
         source_coords_flat[:, 1],
         source_coords_flat[:, 0],
+        torch.full((source_coords_flat.shape[0],), 0.5, device=device),
     ], dim=-1).float()
     coords_for_model.requires_grad_(False)
 
-    pred_flat, _ = model(coords_for_model)
+    pred_flat, _ = model(coords_for_model, variance=None, stochastic_alpha=stochastic_alpha)
     pred_samples = pred_flat.view(num_pixels, num_mc_samples)
     simulated_values = pred_samples.mean(dim=1)
 
-    loss = F.mse_loss(simulated_values.float(), target_values.float()) * 100
+    data_loss = F.mse_loss(simulated_values.float(), target_values.float())
 
-    return {"reconstruction_loss": loss, "total_loss": loss}
+    return {
+        "reconstruction_loss": data_loss,
+        "total_loss":          data_loss,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    # Data
-    parser.add_argument("--volume_tif", type=str, default="/workspace/1_P1MouseHeart_LSM_3.2x_2um_Angle0.tif")
-    parser.add_argument("--psf_path",   type=str, default="/workspace/psf_t0_v0.tif")
-    parser.add_argument("--save_path",  type=str, default="../checkpoints/nglod_mouse_heart_6kprogressive.pth")
-    parser.add_argument("--logdir",     type=str, default="../runs/nglod_mouse_heart_6kprogressive")
+    parser.add_argument("--image_path", type=str, default="/workspace/nonblind/Deblur-INR/datasets/lai/im05_ker04_fft_circular.png")
+    parser.add_argument("--psf_path", type=str, default="/workspace/nonblind/Deblur-INR/results/ker04_truth.png",
+                        help="Path to discrete 2D PSF file (image or .npy).")
+    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_fft_circular.pth")
+    parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_fft_circular")
+    parser.add_argument("--num_mc_samples", type=int, default=100)
+    parser.add_argument("--progressive_steps", type=int, default=2000)
+    parser.add_argument("--num_pixels_per_step", type=int, default=10000,
+                        help="Number of pixels sampled per training step (default: 4096).")
 
-    # Training
-    parser.add_argument("--steps",               type=int,   default=10000)
-    parser.add_argument("--lr",                  type=float, default=1e-2)
-    parser.add_argument("--num_mc_samples",      type=int,   default=100,     help="PSF samples per pixel")
-    parser.add_argument("--num_pixels_per_step", type=int,   default=30000, help="Pixels sampled per step")
+    # Stochastic preconditioning
+    parser.add_argument("--sp_alpha_init", type=float, default=0.03)
+    parser.add_argument("--sp_decay_fraction", type=float, default=0.33)
 
-    # NglodModel architecture
-    parser.add_argument("--num_lods",     type=int, default=5,   help="Total number of octree LODs")
-    parser.add_argument("--base_lod",     type=int, default=3,   help="Coarsest active LOD index")
+    # NglodModel config
+    # base_lod=0 + num_lods=9 → finest 2D resolution = 2^(8+0) = 256 × 256
+    parser.add_argument("--num_lods",     type=int, default=9,   help="Total number of octree LODs")
+    parser.add_argument("--base_lod",     type=int, default=0,   help="Coarsest active LOD index")
     parser.add_argument("--feature_dim",  type=int, default=16,  help="Feature dim per octree node")
     parser.add_argument("--feature_size", type=int, default=4,   help="Base spatial resolution of feature grid")
     parser.add_argument("--hidden_dim",   type=int, default=128, help="MLP hidden width")
-    parser.add_argument("--num_layers",   type=int, default=1,   help="MLP hidden layers")
-    parser.add_argument("--sdfnet_root",  type=str, default="/workspace/non-blind-deconv/models/sdf-net", help="Path to sdf-net directory (default: ../sdf-net)")
-
-    # Progressive LOD unlock
-    parser.add_argument("--progressive_steps", type=int, default=6000,
-                        help="Total steps over which all LODs are unlocked")
+    parser.add_argument("--num_layers",   type=int, default=2,   help="MLP hidden layers")
+    parser.add_argument("--sdfnet_root",  type=str,
+                        default="/workspace/nonblind/workspace/non-blind-deconv/models/sdf-net",
+                        help="Path to sdf-net directory")
 
     args = parser.parse_args()
 
@@ -138,36 +161,27 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # ── load volume (memory-mapped to avoid OOM) ────────────────────────────
-    try:
-        vol_norm = tifffile.memmap(args.volume_tif, mode='r')
-        print(f"Volume memory-mapped: shape={vol_norm.shape}, dtype={vol_norm.dtype}")
-    except (ValueError, NotImplementedError):
-        print("WARNING: tifffile.memmap not supported (likely compressed). Falling back to full load.")
-        vol_norm = tifffile.imread(args.volume_tif)
-        print(f"Volume loaded: shape={vol_norm.shape}, dtype={vol_norm.dtype}")
+    image = cv2.imread(args.image_path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f"Failed to read image: {args.image_path}")
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if image.ndim != 2:
+        raise ValueError(f"Only 2D images are supported, got shape={image.shape}")
 
-    n_dims = len(vol_norm.shape)
-    if n_dims != 3:
-        raise ValueError(f"NglodModel requires 3-D input, got shape {vol_norm.shape}")
-
-    # ── load PSF ────────────────────────────────────────────────────────────
-    if args.psf_path.endswith((".tif", ".tiff")):
-        discrete_psf_np = tifffile.imread(args.psf_path).astype(np.float32)
-    elif args.psf_path.endswith(".npy"):
-        discrete_psf_np = np.load(args.psf_path).astype(np.float32)
+    if np.issubdtype(image.dtype, np.integer):
+        image_norm = image.astype(np.float32) / float(np.iinfo(image.dtype).max)
     else:
-        raise ValueError(f"Unsupported PSF format: {args.psf_path}")
+        image_norm = image.astype(np.float32)
+        max_val = float(np.max(image_norm)) if image_norm.size > 0 else 1.0
+        if max_val > 1.0:
+            image_norm = image_norm / max_val
 
-    discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
-    print(f"Discrete PSF shape: {discrete_psf.shape}, range=[{discrete_psf.min():.4f}, {discrete_psf.max():.4f}]")
+    print(f"Image loaded: shape={image_norm.shape}")
+    num_pixels_per_step = args.num_pixels_per_step
 
-    if len(discrete_psf.shape) != n_dims:
-        raise ValueError(f"PSF is {len(discrete_psf.shape)}-D but volume is {n_dims}-D")
-
-    # ── model ───────────────────────────────────────────────────────────────
     model = NglodModel(
-        n_input_dims=n_dims,
+        n_input_dims=3,
         num_lods=args.num_lods,
         base_lod=args.base_lod,
         feature_dim=args.feature_dim,
@@ -178,75 +192,87 @@ def main():
     ).to(device)
     model.train()
 
-    feature_params = sum(p.numel() for p in model.encoder.parameters())
-    mlp_params     = sum(p.numel() for p in model.decoder.parameters())
-    total_params   = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters:   {total_params:,}")
-    print(f"  Feature grid:     {feature_params:,}")
-    print(f"  MLP decoder:      {mlp_params:,}")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
 
-    # ── optimiser & scheduler ───────────────────────────────────────────────
+    # ── Load discrete PSF ─────────────────────────────────────────────────
+    if args.psf_path.endswith(".npy"):
+        discrete_psf_np = np.load(args.psf_path).astype(np.float32)
+    else:
+        discrete_psf_np = cv2.imread(args.psf_path, cv2.IMREAD_UNCHANGED)
+        if discrete_psf_np is None:
+            raise ValueError(f"Unreadable PSF: {args.psf_path}")
+        if discrete_psf_np.ndim == 3:
+            discrete_psf_np = cv2.cvtColor(discrete_psf_np, cv2.COLOR_BGR2GRAY)
+        discrete_psf_np = discrete_psf_np.astype(np.float32)
+    if discrete_psf_np.ndim != 2:
+        raise ValueError(f"PSF must be 2D, got shape={discrete_psf_np.shape}")
+    psf_sum = float(discrete_psf_np.sum())
+    if psf_sum <= 0:
+        raise ValueError("PSF sum must be positive.")
+    discrete_psf_np /= psf_sum
+    discrete_psf = torch.from_numpy(discrete_psf_np).float().to(device)
+    # scipy.ndimage.convolve flips the kernel; flip here so the forward model matches
+    discrete_psf = torch.flip(discrete_psf, [0, 1])
+    print(f"PSF loaded: shape={discrete_psf.shape}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-15)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=0)
-    scaler    = torch.amp.GradScaler()
-    writer    = SummaryWriter(log_dir=args.logdir)
+    scaler = torch.amp.GradScaler('cuda')
+    writer = SummaryWriter(log_dir=args.logdir)
 
-    # ── dataset / dataloader ────────────────────────────────────────────────
-    dataset = VolumeDataset(
-        norm_volume_tensor=vol_norm,
-        num_mc_samples=args.num_mc_samples,
-        num_pixels_per_step=args.num_pixels_per_step,
+    dataset = ImageDataset(
+        norm_image_tensor=image_norm,
+        num_pixels_per_step=num_pixels_per_step,
         num_batches=args.steps,
-        discrete_psf=discrete_psf,
     )
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=8)
-    data_iter  = iter(dataloader)
+    inv_shape = dataset.inv_shape
 
-    # ── progressive LOD unlock ──────────────────────────────────────────────
-    initial_lods   = args.base_lod          # start at the coarsest LOD
-    total_lods     = args.num_lods
-    lods_to_unlock = total_lods - initial_lods
-    steps_per_lod  = max(1, args.progressive_steps // lods_to_unlock)
-    print(f"Progressive training: {initial_lods} → {total_lods} LODs, "
-          f"+1 every {steps_per_lod} steps over {args.progressive_steps} steps")
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    data_iter = iter(dataloader)
 
+    n_levels = args.num_lods
+    initial_levels = 1  # start from coarsest LOD and ramp up
+    steps_per_level = args.progressive_steps // max(n_levels - initial_levels, 1)
+    sp_decay_steps = int(args.steps * args.sp_decay_fraction)
     last_set_level = -1
 
-    pbar = tqdm(
-        total=args.steps,
-        desc="Training",
-        dynamic_ncols=True,
-        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
-    )
+    pbar = tqdm(total=args.steps, desc="Training", dynamic_ncols=True)
 
     for step in range(args.steps):
-        # unlock one LOD at a time
-        current_level = min(initial_lods + (step // steps_per_lod), total_lods)
+        current_level = min(initial_levels + (step // steps_per_level), n_levels)
         if current_level != last_set_level:
             model.set_max_level(current_level)
             last_set_level = current_level
-            if step > 0:
-                tag = "(max)" if current_level >= total_lods else ""
-                print(f"\nStep {step}: Unlocked LOD {current_level}/{total_lods} {tag}")
 
         batch = next(data_iter)
         batch = {k: (v.squeeze(0) if hasattr(v, 'squeeze') else v) for k, v in batch.items()}
 
         optimizer.zero_grad(set_to_none=True)
 
+        if step < sp_decay_steps:
+            progress = step / sp_decay_steps
+            current_alpha = args.sp_alpha_init * np.exp(-5.0 * progress)
+        else:
+            current_alpha = 0.0
+
         loss_dict = psf_uniform_sampling_step(
             model=model,
             batch=batch,
             num_mc_samples=args.num_mc_samples,
             device=device,
+            discrete_psf=discrete_psf,
+            inv_shape=inv_shape,
+            stochastic_alpha=current_alpha,
         )
 
         for key, value in loss_dict.items():
             writer.add_scalar(f"train/{key}", value.item(), step)
 
-        scaler.scale(loss_dict["total_loss"]).backward()
+        loss = loss_dict["total_loss"]
+        scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -254,11 +280,9 @@ def main():
         scheduler.step()
         writer.add_scalar("train/LearningRate", current_lr, step)
         writer.add_scalar("train/GradNorm", grad_norm.item(), step)
-        writer.add_scalar("train/GradClipped", float(grad_norm > 50.0), step)
 
         pbar.update(1)
-        pbar.set_postfix({'loss': f'{loss_dict["reconstruction_loss"].item():.6f}',
-                          'lr':   f'{current_lr:.2e}'})
+        pbar.set_postfix({'loss': f'{loss_dict["reconstruction_loss"].item():.6f}'})
 
     pbar.close()
 
