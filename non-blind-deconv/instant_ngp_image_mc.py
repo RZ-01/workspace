@@ -53,13 +53,14 @@ def generate_offsets_on_gpu(
     n: int,
     discrete_psf: torch.Tensor,
     device: torch.device,
+    jitter: bool = False,
 ) -> torch.Tensor:
     """
     Sample n PSF offsets on the GPU.
 
     Steps:
       1. Sample a histogram bin via multinomial (integer pixel offset).
-      2. Add uniform jitter within that pixel: U(-0.5, +0.5) per axis.
+      2. Optionally add uniform jitter within that pixel: U(-0.5, +0.5) per axis.
 
     Returns offsets of shape (n, 2), float32, in pixel units centred at PSF origin.
     """
@@ -69,11 +70,19 @@ def generate_offsets_on_gpu(
     h, w = discrete_psf.shape
     y_idx = idx // w
     x_idx = idx % w
-    jitter = torch.rand((n, 2), device=device) - 0.5
+    if jitter:
+        jitter_offsets = torch.rand((n, 2), device=device) - 0.5
+    else:
+        jitter_offsets = torch.zeros((n, 2), device=device)
     return torch.stack([
-        y_idx.float() - (h - 1) / 2.0 + jitter[:, 0],
-        x_idx.float() - (w - 1) / 2.0 + jitter[:, 1],
+        y_idx.float() - (h - 1) / 2.0 + jitter_offsets[:, 0],
+        x_idx.float() - (w - 1) / 2.0 + jitter_offsets[:, 1],
     ], dim=1)
+
+
+def reflect_coords(source_coords: torch.Tensor) -> torch.Tensor:
+    s = source_coords.abs()
+    return (1.0 - (s - 1.0).abs()).clamp(0.0, 1.0)
 
 
 def psf_uniform_sampling_step(
@@ -84,6 +93,8 @@ def psf_uniform_sampling_step(
     discrete_psf: torch.Tensor,
     inv_shape: torch.Tensor,
     stochastic_alpha: float = 0.0,
+    use_reflect: bool = True,
+    jitter_offsets: bool = False,
 ) -> dict:
     target_coords = batch['target_coords'].to(device, non_blocking=True)
     target_values = batch['target_values'].to(device, non_blocking=True)
@@ -93,14 +104,20 @@ def psf_uniform_sampling_step(
     sampling_budget = num_pixels * num_mc_samples
 
     sampled_offsets = generate_offsets_on_gpu(
-        sampling_budget, discrete_psf=discrete_psf, device=device,
+        sampling_budget,
+        discrete_psf=discrete_psf,
+        device=device,
+        jitter=jitter_offsets,
     )  # (N, 2), pixel units
 
     inv_shape_gpu = inv_shape.to(device, non_blocking=True)
     sampled_offsets = (sampled_offsets * inv_shape_gpu).view(num_pixels, num_mc_samples, n_dims)
 
     source_coords = target_coords.unsqueeze(1) + sampled_offsets
-    source_coords = torch.clamp(source_coords, 0.0, 1.0)
+    if use_reflect:
+        source_coords = reflect_coords(source_coords)
+    else:
+        source_coords = torch.clamp(source_coords, 0.0, 1.0)
     source_coords_flat = source_coords.view(-1, n_dims)
 
     coords_for_model = torch.stack([
@@ -131,6 +148,10 @@ def main():
     parser.add_argument("--save_path", type=str, default="../checkpoints/im05_ker04_mc.pth")
     parser.add_argument("--logdir", type=str, default="../runs/im05_ker04_mc")
     parser.add_argument("--num_mc_samples", type=int, default=800)
+    parser.add_argument("--mc_jitter", action="store_true",
+                        help="Add U(-0.5,+0.5) jitter inside sampled PSF bins. Off by default to match discrete convolution.")
+    parser.add_argument("--boundary", choices=("reflect", "clamp"), default="reflect",
+                        help="Boundary handling for sampled source coordinates.")
     parser.add_argument("--progressive_steps", type=int, default=300)
     parser.add_argument("--num_pixels_per_step", type=int, default=10000,
                         help="Number of pixels sampled per training step (default: 4096).")
@@ -276,6 +297,8 @@ def main():
             discrete_psf=discrete_psf,
             inv_shape=inv_shape,
             stochastic_alpha=current_alpha,
+            use_reflect=(args.boundary == "reflect"),
+            jitter_offsets=args.mc_jitter,
         )
 
         for key, value in loss_dict.items():
